@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+
+# Nix build output and local development environment
+/result
+/result-*
+.direnv/
+
+# Generated ride bundles and local editing projects
+/export/
+/project/
+*.gpxproj
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
