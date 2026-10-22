@@ -1,6 +1,6 @@
 [package]
 name = "rlv-forge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "RLV Forge: native GPX editing and video alignment for indoor cycling"
 license = "MIT"

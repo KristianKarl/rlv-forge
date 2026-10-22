@@ -1266,7 +1266,13 @@ impl Studio {
         };
         if let Some((at, result)) = preview {
             self.preview_worker = None;
-            if self.playing || (at - self.position).abs() >= 0.0005 {
+            let current = (at - self.position).abs() < 0.0005;
+            // Show intermediate frames while seeking, without replacing an exact
+            // playhead frame or reporting errors from an obsolete seek.
+            if self.playing
+                || (!current
+                    && (self.pick_kind.is_some() || self.preview_ready() || result.is_err()))
+            {
                 return;
             }
             self.decoded_at = Some(at);
@@ -1994,8 +2000,9 @@ mod tests {
         let mut studio = prepared_studio(&timeline_track(), 60.0);
         let ctx = egui::Context::default();
         ready_preview(&mut studio, &ctx);
-        let texture = studio.texture.as_ref().unwrap().id();
         studio.seek_video(10.0, 59.96);
+        ready_preview(&mut studio, &ctx);
+        let texture = studio.texture.as_ref().unwrap().id();
         let (sender, receiver) = mpsc::channel();
         sender
             .send((
@@ -2011,8 +2018,78 @@ mod tests {
         studio.poll(&ctx);
         assert!(studio.preview_worker.is_none());
         assert_eq!(studio.position, 10.0);
-        assert_eq!(studio.decoded_at, Some(0.0));
+        assert_eq!(studio.decoded_at, Some(10.0));
         assert_eq!(studio.texture.as_ref().unwrap().id(), texture);
+    }
+
+    #[test]
+    fn completed_previews_update_while_either_timeline_is_still_scrubbing() {
+        for gpx in [false, true] {
+            let mut studio = prepared_studio(&timeline_track(), 60.0);
+            let ctx = egui::Context::default();
+            ready_preview(&mut studio, &ctx);
+            for position in [10.0, 20.0, 15.0, 5.0] {
+                let requested = studio.position;
+                let (sender, receiver) = mpsc::channel();
+                studio.preview_worker = Some(receiver);
+                if gpx {
+                    studio.seek_gpx(position, 59.96).unwrap();
+                } else {
+                    studio.seek_video(position, 59.96);
+                }
+                sender
+                    .send((
+                        requested,
+                        Ok(video::PreviewFrame {
+                            width: 1,
+                            height: 1,
+                            rgb: vec![255, 0, 0],
+                        }),
+                    ))
+                    .unwrap();
+                studio.poll(&ctx);
+                assert_eq!(studio.position, position);
+                assert_eq!(studio.decoded_at, Some(requested));
+                assert_eq!(studio.texture.as_ref().unwrap().size(), [1, 1]);
+                assert!(studio.preview_worker.is_none());
+                assert!(!studio.preview_ready());
+                assert!(!studio.playing);
+            }
+            let (sender, receiver) = mpsc::channel();
+            studio.preview_worker = Some(receiver);
+            sender
+                .send((
+                    studio.position,
+                    Ok(video::PreviewFrame {
+                        width: 2,
+                        height: 1,
+                        rgb: vec![0; 6],
+                    }),
+                ))
+                .unwrap();
+            studio.poll(&ctx);
+            assert_eq!(studio.decoded_at, Some(studio.position));
+            assert_eq!(studio.texture.as_ref().unwrap().size(), [2, 1]);
+            assert!(studio.preview_ready());
+        }
+    }
+
+    #[test]
+    fn obsolete_preview_errors_do_not_interrupt_scrubbing() {
+        let mut studio = prepared_studio(&timeline_track(), 60.0);
+        let ctx = egui::Context::default();
+        ready_preview(&mut studio, &ctx);
+        let (sender, receiver) = mpsc::channel();
+        studio.preview_worker = Some(receiver);
+        studio.seek_video(10.0, 59.96);
+        sender
+            .send((0.0, Err("Obsolete seek failed.".into())))
+            .unwrap();
+        studio.poll(&ctx);
+        assert_eq!(studio.decoded_at, Some(0.0));
+        assert!(studio.texture.is_some());
+        assert!(studio.error.is_none());
+        assert!(studio.preview_worker.is_none());
     }
 
     #[test]

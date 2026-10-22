@@ -217,7 +217,9 @@ file, or closing the app.
    the full original route. The **GPX seconds** slider under the map and the
    full-width video slider are linked through the applied sync mapping.
    Scrubbing either pauses playback and updates the other timeline, preview
-   and marker. Each seek pans the map to center the red marker without changing
+   and marker. The video preview updates while dragging as frames finish decoding,
+   then catches up to the final position after release.
+   Each seek pans the map to center the red marker without changing
    its zoom, including when jumping over cuts or independently picking landmarks.
    You can still drag to explore; the next seek recenters the marker.
    Scrolling the page keeps the route, sync pins and picking aligned with the
