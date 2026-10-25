@@ -2,13 +2,14 @@
 name = "rlv-forge"
 version = "0.1.1"
 edition = "2021"
-description = "RLV Forge: native GPX editing and video alignment for indoor cycling"
+description = "RLV Forge: native GPX/FIT import, route editing and video alignment for indoor cycling"
 license = "MIT"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rfd = "0.17.2"
 roxmltree = "0.21.1"
+fitparser = "0.11"
 walkers = "0.63.0"
 directories = "6"
 env_logger = "0.11"

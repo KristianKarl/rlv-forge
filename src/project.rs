@@ -120,7 +120,7 @@ impl Project {
                     .is_ok_and(|source| source == target)
             }) {
                 return Err(
-                    "A project cannot overwrite its referenced GPX or prepared video.".into(),
+                    "A project cannot overwrite its referenced track or prepared video.".into(),
                 );
             }
         }
@@ -246,6 +246,41 @@ mod tests {
         value["format"] = serde_json::json!(FORMAT);
         assert_eq!(saved, value);
         assert!(Project::load(&path).is_ok());
+    }
+
+    #[test]
+    fn fit_projects_restore_embedded_track_without_the_original_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.fit");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("data/2026-10-24.fit"),
+            &source,
+        )
+        .unwrap();
+        let mut track = Track::read(&source).unwrap();
+        let original = track.clone();
+        track
+            .apply(
+                rlv_forge::gpx::Operation::Elevate(5.0),
+                [0.0, track.total_distance()],
+            )
+            .unwrap();
+        let mut studio = Studio::default();
+        studio.set_track(&track);
+        let mut project = Project::new(
+            &track,
+            &original,
+            studio.project_state().unwrap(),
+            TrackMap::offline().project_view(),
+        );
+        project.source_path = Some(source.clone());
+        let path = directory.path().join("fit.gpxproj");
+        project.save(&path, None).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let loaded = Project::load(&path).unwrap();
+        assert_eq!(*loaded.track, track);
+        assert_eq!(*loaded.source, original);
+        assert_eq!(loaded.document.source_path, Some(source));
     }
 
     #[test]

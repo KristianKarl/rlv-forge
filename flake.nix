@@ -12,6 +12,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           linuxLibraries = with pkgs; [
+            dbus
             libglvnd
             libxkbcommon
             wayland
@@ -34,6 +35,7 @@
             ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.xorg-server
               pkgs.mesa
+              pkgs.zenity
             ];
             buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxLibraries;
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";

@@ -3,8 +3,8 @@
 **Prepare real rides for indoor training.**
 
 RLV Forge is a native Rust desktop app for preparing **Real Life Video (RLV)**
-indoor cycling routes: smooth GPX elevations, cut unwanted route sections,
-align the route with prepared video, and export Incyclist-ready bundles.
+indoor cycling routes: import GPX or FIT files, smooth elevations, cut unwanted
+route sections, align the route with prepared video, and export Incyclist-ready bundles.
 Its elevation-editing workflow was inspired by the
 [GPX Elevation Smoother web app](https://mtbsettimo.altervista.org/gpx-elevation-smoother/gpxsmoother.html).
 No browser, server, or account is required. Editing and GPX export work
@@ -23,6 +23,8 @@ nix develop
 cargo run
 # Optionally open a track on launch:
 cargo run -- data/2026-09-22_120200.gpx
+# FIT activities are also supported:
+cargo run -- data/2026-10-24.fit
 # Optionally open a video alongside the track:
 cargo run -- data/2026-09-22_120200.gpx /path/to/ride.mp4
 # Resume saved editing work:
@@ -30,16 +32,22 @@ cargo run -- /path/to/ride.gpxproj
 ```
 
 The flake provides Rust, Cargo, rustfmt, Clippy, rust-analyzer, pkg-config,
-FFmpeg/ffprobe, and Linux X11/Wayland/OpenGL libraries. It supports x86_64/aarch64 Linux and
+FFmpeg/ffprobe, Linux X11/Wayland/OpenGL and D-Bus libraries, and Zenity for
+fallback file dialogs. It supports x86_64/aarch64 Linux and
 Apple Silicon macOS (the pinned nixpkgs no longer supports Intel macOS).
 On Linux the file picker uses the desktop's XDG portal; run the app
-inside a graphical desktop with a working portal service. Initial dependency
+inside a graphical desktop with a working portal service. If the portal is
+unavailable, the file picker falls back to Zenity. Run release builds from the
+development shell too (`nix develop --command ./target/release/rlv-forge`) so
+the runtime libraries and fallback dialog are available. After changes to
+`flake.nix`, exit and re-enter the shell to refresh its environment. Initial dependency
 downloads require network access. Keep `Cargo.lock` and `flake.lock` for
 reproducible dependency resolution.
 
 Without Nix, install stable Rust and your platform's native development
 dependencies for egui/winit (on Linux: a C linker, pkg-config,
-X11/Wayland, libxkbcommon, and OpenGL). Then use the same Cargo commands.
+X11/Wayland, libxkbcommon, OpenGL, and D-Bus). A working XDG desktop portal
+or Zenity is also needed for file dialogs. Then use the same Cargo commands.
 Video preview and pairing additionally require `ffmpeg` and `ffprobe` on
 `PATH`. Media tests also use the H.264/libx264 encoder to create fixtures;
 the app never re-encodes video. GPX-only editing does not require FFmpeg.
@@ -56,7 +64,8 @@ is `rlv_forge`. The release executable is `target/release/rlv-forge`.
 
 ## Workflow
 
-1. Open or drop a GPX file. Both sample tracks in `data/` are supported.
+1. Open or drop a GPX or FIT file. Sample tracks are included in `data/`,
+   including `2026-10-24.fit` and `2026-10-24.gpx` from the same ride.
    The upper-right map automatically fits the route, with green/red start/end
    markers. Hovering over chart 3 moves the red marker to the corresponding
    route position, interpolated between samples; leaving the chart restores
@@ -93,6 +102,15 @@ Stationary samples and steps of 1 cm or less retain the preceding slope
 within the same segment, avoiding artificial spikes to zero at repeated
 GPS positions. Each segment starts at zero slope until a moving step.
 
+FIT activities are converted internally to GPX, retaining recorded GPS
+positions, elevations, timestamps, and available power, heart rate, cadence,
+and temperature samples. Enhanced altitude is preferred when available.
+Records without GPS coordinates are skipped, with a segment break so missing
+GPS coverage does not add distance. Activities without GPS cannot be imported.
+Other FIT messages and developer fields are not retained. Editing, video
+alignment, and project saving work as for GPX imports; exports remain GPX,
+not FIT. The imported FIT file is not changed.
+
 ### Save and resume editing
 
 Use **Save project** (**Ctrl/Cmd+S**) to save an editable `.gpxproj` file,
@@ -111,12 +129,12 @@ chart/map preferences. Playback resumes paused. Finish or cancel active
 landmark picking before saving. Undo/redo history is session-only and is not
 stored in the project.
 
-The GPX is embedded, so its original file is not needed to resume. Video is
-referenced by its path, never embedded or changed; keep the prepared video
+The GPX (including converted FIT imports) is embedded, so its original file
+is not needed to resume. Video is referenced by its path, never embedded or changed; keep the prepared video
 available. If it has moved, reopen it with **Open prepared video** on the video
 page; the app preserves sync points when the replacement's duration supports
 them. Project saves replace the destination atomically and cannot overwrite
-the referenced GPX or video. Invalid project files leave the current work intact.
+the referenced GPX/FIT or video. Invalid project files leave the current work intact.
 Before opening another file or closing with unsaved work, choose **Save project
 and continue**, **Discard changes**, or **Cancel**. Exporting GPX or an Incyclist
 bundle is separate from saving an editable project.
