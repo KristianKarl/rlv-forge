@@ -307,7 +307,7 @@ impl RlvForge {
             hover_distance: None,
             chart: Chart::Elevation,
             show_original: true,
-            status: "Open a GPX file or drop one anywhere in this window.".into(),
+            status: "Open a GPX or FIT file or drop one anywhere in this window.".into(),
             error: None,
             preview: None,
             modified_slopes: Vec::new(),
@@ -354,7 +354,9 @@ impl RlvForge {
                 if project_only {
                     dialog.pick_file()
                 } else {
-                    dialog.add_filter("GPX tracks", &["gpx"]).pick_file()
+                    dialog
+                        .add_filter("GPX and FIT tracks", &["gpx", "fit"])
+                        .pick_file()
                 }
             });
             match path {
@@ -550,7 +552,7 @@ impl RlvForge {
         let track = self
             .track
             .as_deref()
-            .ok_or("Open a GPX before saving a project.")?;
+            .ok_or("Open a track before saving a project.")?;
         let source = self.cut_source.as_deref().unwrap_or(track);
         let mut document = crate::project::Project::new(
             track,
@@ -566,7 +568,7 @@ impl RlvForge {
             .as_deref()
             .map(std::path::absolute)
             .transpose()
-            .map_err(|error| format!("Cannot resolve source GPX path: {error}"))?;
+            .map_err(|error| format!("Cannot resolve source track path: {error}"))?;
         document.selection = self.selection;
         document.chart = self.chart;
         document.show_original = self.show_original;
@@ -724,15 +726,15 @@ impl RlvForge {
     }
 
     fn import_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label("1. Select a GPX file:");
+        ui.label("1. Select a GPX or FIT file:");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Open GPX...").clicked() {
+            if ui.button("Open GPX/FIT...").clicked() {
                 self.request(Pending::Open(None), ctx);
             }
             if let Some(path) = &self.source_path {
                 ui.label(path.display().to_string());
             } else {
-                ui.label("Or drop a .gpx file into this window.");
+                ui.label("Or drop a .gpx or .fit file into this window.");
             }
         });
         if let Some(track) = &self.track {
@@ -882,7 +884,7 @@ impl RlvForge {
             painter.text(
                 plot.center(),
                 Align2::CENTER_CENTER,
-                "Open a GPX file to see its elevation profile",
+                "Open a GPX or FIT file to see its elevation profile",
                 FontId::proportional(18.0),
                 BLUE,
             );

@@ -105,6 +105,12 @@ impl Track {
     }
 
     pub fn read(path: &Path) -> Result<Self, String> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("fit"))
+        {
+            return crate::fit::read(path);
+        }
         let source = std::fs::read_to_string(path)
             .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
         Self::parse(source)

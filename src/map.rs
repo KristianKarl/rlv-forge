@@ -309,7 +309,7 @@ impl TrackMap {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Open a GPX file to see its route",
+                "Open a GPX or FIT file to see its route",
                 egui::FontId::proportional(15.0),
                 ROUTE,
             );
