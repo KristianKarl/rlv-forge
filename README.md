@@ -4,7 +4,7 @@
 
 RLV Forge is a native Rust desktop app for preparing **Real Life Video (RLV)**
 indoor cycling routes: import GPX or FIT files, smooth elevations, cut unwanted
-route sections, align the route with prepared video, and export Incyclist-ready bundles.
+route sections, align the route with prepared video, and export [Incyclist-ready bundles](https://incyclist.com/faq/#own-video).
 Its elevation-editing workflow was inspired by the
 [GPX Elevation Smoother web app](https://mtbsettimo.altervista.org/gpx-elevation-smoother/gpxsmoother.html).
 No browser, server, or account is required. Editing and GPX export work
@@ -13,6 +13,8 @@ The **Video & Incyclist** page uses an already-prepared video as a read-only
 reference. Match video frames to locations on the original GPX route, skip
 omitted sections, level elevation joins, and export a ready-to-import
 Incyclist bundle without changing video.
+
+The export bundle is target for the [InCyclist app](https://incyclist.com)
 
 ## Develop and run
 
