@@ -350,12 +350,15 @@ impl RlvForge {
         self.studio.pause();
         self.spawn(ctx, move || {
             let path = path.or_else(|| {
-                let dialog = rfd::FileDialog::new().add_filter("RLV Forge project", &["gpxproj"]);
+                let dialog = rfd::FileDialog::new();
                 if project_only {
-                    dialog.pick_file()
+                    dialog
+                        .add_filter("RLV Forge project", &["gpxproj"])
+                        .pick_file()
                 } else {
                     dialog
                         .add_filter("GPX and FIT tracks", &["gpx", "fit"])
+                        .add_filter("RLV Forge project", &["gpxproj"])
                         .pick_file()
                 }
             });
