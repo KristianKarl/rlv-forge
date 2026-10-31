@@ -24,7 +24,7 @@ With Nix and flakes enabled:
 # Run the packaged app without entering a development shell:
 nix run .
 # Optionally pass a track or saved project:
-nix run . -- /path/to/ride.gpxproj
+nix run . -- --gpxproj /path/to/ride.gpxproj
 # Or build once and run the packaged executable:
 nix build
 ./result/bin/rlv-forge
@@ -40,14 +40,24 @@ For development:
 nix develop
 cargo run
 # Optionally open a track on launch:
-cargo run -- data/2026-09-22_120200.gpx
+cargo run -- --fit-gpx data/2026-09-22_120200.gpx
 # FIT activities are also supported:
-cargo run -- data/2026-10-24.fit
+cargo run -- --fit-gpx data/2026-10-24.fit
 # Optionally open a video alongside the track:
-cargo run -- data/2026-09-22_120200.gpx /path/to/ride.mp4
+cargo run -- --fit-gpx data/2026-09-22_120200.gpx --video /path/to/ride.mp4
 # Resume saved editing work:
-cargo run -- /path/to/ride.gpxproj
+cargo run -- --gpxproj /path/to/ride.gpxproj
+# Show command-line help or version (including the abbreviated build commit):
+cargo run -- --help
+cargo run -- --version
 ```
+
+`--gpxproj` cannot be combined with `--fit-gpx` or `--video`.
+`--fit-gpx` and `--video` can be used together or independently.
+Legacy positional track/project and video arguments are still supported.
+When building from source without Git metadata, set `RLV_FORGE_GIT_SHA`
+to the abbreviated commit SHA; otherwise the version reports `unknown`
+and the build emits a warning. Nix flake builds supply the revision automatically.
 
 The flake provides Rust, Cargo, rustfmt, Clippy, rust-analyzer, pkg-config,
 FFmpeg/ffprobe, Linux X11/Wayland/OpenGL and D-Bus libraries, and Zenity for

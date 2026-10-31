@@ -1,4 +1,4 @@
-{ lib, stdenv, rustPlatform, pkg-config, makeWrapper, ffmpeg, zenity, runtimeLibraries }:
+{ lib, stdenv, rustPlatform, pkg-config, makeWrapper, ffmpeg, zenity, runtimeLibraries, gitRevision ? null }:
 
 let
   manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
@@ -12,6 +12,7 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ./Cargo.toml
       ./Cargo.lock
+      ./build.rs
       ./src
       ./tests
       ./data
@@ -19,6 +20,10 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ./Cargo.lock;
+
+  env = lib.optionalAttrs (gitRevision != null) {
+    RLV_FORGE_GIT_SHA = builtins.substring 0 7 gitRevision;
+  };
 
   nativeBuildInputs = [ pkg-config makeWrapper ];
   buildInputs = runtimeLibraries;
