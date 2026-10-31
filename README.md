@@ -21,6 +21,22 @@ The export bundle is target for the [InCyclist app](https://incyclist.com)
 With Nix and flakes enabled:
 
 ```sh
+# Run the packaged app without entering a development shell:
+nix run .
+# Optionally pass a track or saved project:
+nix run . -- /path/to/ride.gpxproj
+# Or build once and run the packaged executable:
+nix build
+./result/bin/rlv-forge
+```
+
+The package wraps the executable with its runtime libraries and puts
+FFmpeg/ffprobe and, on Linux, Zenity on `PATH`. It still requires a graphical
+desktop and working host GPU drivers.
+
+For development:
+
+```sh
 nix develop
 cargo run
 # Optionally open a track on launch:
@@ -39,9 +55,10 @@ fallback file dialogs. It supports x86_64/aarch64 Linux and
 Apple Silicon macOS (the pinned nixpkgs no longer supports Intel macOS).
 On Linux the file picker uses the desktop's XDG portal; run the app
 inside a graphical desktop with a working portal service. If the portal is
-unavailable, the file picker falls back to Zenity. Run release builds from the
-development shell too (`nix develop --command ./target/release/rlv-forge`) so
-the runtime libraries and fallback dialog are available. After changes to
+unavailable, the file picker falls back to Zenity. Raw Cargo release builds
+still need the development shell
+(`nix develop --command ./target/release/rlv-forge`); use `nix run .` or
+`./result/bin/rlv-forge` to run without it. After changes to
 `flake.nix`, exit and re-enter the shell to refresh its environment. Initial dependency
 downloads require network access. Keep `Cargo.lock` and `flake.lock` for
 reproducible dependency resolution.
