@@ -7,21 +7,40 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      runtimeLibrariesFor = pkgs:
+        pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [
+          dbus
+          libglvnd
+          libxkbcommon
+          wayland
+          libx11
+          libxcursor
+          libxi
+          libxrandr
+          libxcb
+        ]);
     in {
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.callPackage ./package.nix {
+            runtimeLibraries = runtimeLibrariesFor pkgs;
+          };
+        });
+
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/rlv-forge";
+          meta.description = self.packages.${system}.default.meta.description;
+        };
+      });
+
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          linuxLibraries = with pkgs; [
-            dbus
-            libglvnd
-            libxkbcommon
-            wayland
-            libx11
-            libxcursor
-            libxi
-            libxrandr
-            libxcb
-          ];
+          runtimeLibraries = runtimeLibrariesFor pkgs;
         in {
           default = pkgs.mkShell {
             packages = with pkgs; [
@@ -37,10 +56,10 @@
               pkgs.mesa
               pkgs.zenity
             ];
-            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxLibraries;
+            buildInputs = runtimeLibraries;
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath linuxLibraries}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibraries}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             '';
           };
         });
