@@ -1,3 +1,4 @@
+mod cli;
 mod map;
 mod project;
 mod studio;
@@ -15,6 +16,7 @@ fn test_ui(
 }
 
 fn main() -> eframe::Result {
+    let (path, video) = <cli::Args as clap::Parser>::parse().startup_paths();
     env_logger::init();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -23,9 +25,6 @@ fn main() -> eframe::Result {
             .with_min_inner_size([760.0, 640.0]),
         ..Default::default()
     };
-    let mut args = std::env::args_os().skip(1);
-    let path = args.next().map(std::path::PathBuf::from);
-    let video = args.next().map(std::path::PathBuf::from);
     eframe::run_native(
         "RLV Forge",
         options,

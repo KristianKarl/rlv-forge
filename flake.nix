@@ -26,6 +26,7 @@
         in {
           default = pkgs.callPackage ./package.nix {
             runtimeLibraries = runtimeLibrariesFor pkgs;
+            gitRevision = self.rev or self.dirtyRev or null;
           };
         });
 
