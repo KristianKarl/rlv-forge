@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 use walkers::{
-    lon_lat, sources::OpenStreetMap, HttpOptions, HttpTiles, Map, MapMemory, Plugin, Position,
-    Projector, TileId, TilePiece, Tiles,
+    lon_lat, sources::OpenStreetMap, HttpOptions, HttpTiles, Map, MapMemory, MercatorProjection,
+    Plugin, Position, Projector, TileId, TilePiece, Tiles,
 };
 
 const ROUTE: Color32 = Color32::from_rgb(140, 150, 160);
@@ -120,6 +120,7 @@ impl TrackMap {
             .unwrap_or_else(|| map_position(0.0, latitude));
         let projector = Projector::new(
             egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 1.0)),
+            &MercatorProjection,
             &self.memory,
             center,
         );
@@ -701,15 +702,9 @@ impl Plugin for RouteOverlay<'_> {
         ui: &mut egui::Ui,
         response: &egui::Response,
         projector: &Projector,
-        memory: &MapMemory,
+        _memory: &MapMemory,
     ) {
         let painter = ui.painter().with_clip_rect(response.rect);
-        // Walkers centers its tiles in the clipped viewport, not the full scrolled widget.
-        let projector = Projector::new(
-            painter.clip_rect(),
-            memory,
-            projector.unproject(response.rect.center().to_vec2()),
-        );
         for selected in [false, true] {
             let track = if selected {
                 self.track
@@ -798,7 +793,7 @@ impl Plugin for RouteOverlay<'_> {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     *sync.picked.borrow_mut() = Some(route_picks(
                         self.reference_track.unwrap_or(self.track),
-                        &projector,
+                        projector,
                         pointer,
                         sync.overlay.hint,
                     ));
@@ -1156,7 +1151,7 @@ mod tests {
         let mut memory = MapMemory::default();
         memory.center_at(center);
         memory.set_zoom(14.0).unwrap();
-        let projector = Projector::new(rect, &memory, center);
+        let projector = Projector::new(rect, &MercatorProjection, &memory, center);
         let picks = route_picks(
             &track,
             &projector,
@@ -1204,7 +1199,7 @@ mod tests {
                     let mut memory = MapMemory::default();
                     memory.center_at(center);
                     memory.set_zoom(zoom).unwrap();
-                    let projector = Projector::new(rect, &memory, center);
+                    let projector = Projector::new(rect, &MercatorProjection, &memory, center);
                     omitted_peak = projector.project(lon_lat(1.0, 50.0)).to_pos2();
                     expected_marker = projector.project(lon_lat(longitude, 0.0)).to_pos2();
                     Box::new(RouteOverlay {
@@ -1273,7 +1268,7 @@ mod tests {
                     let mut memory = MapMemory::default();
                     memory.center_at(center);
                     memory.set_zoom(zoom).unwrap();
-                    let projector = Projector::new(rect, &memory, center);
+                    let projector = Projector::new(rect, &MercatorProjection, &memory, center);
                     expected = [(0.5, 0.0), (1.0, 0.0), (1.0, 50.0), (2.0, 0.0), (2.5, 0.0)]
                         .into_iter()
                         .map(|(lon, lat)| projector.project(lon_lat(lon, lat)).to_pos2())
@@ -1409,7 +1404,7 @@ mod tests {
             memory.center_at(center);
             memory.set_zoom(zoom).unwrap();
             let rect = Rect::from_min_size(pos2(0.0, 0.0), size);
-            let projector = Projector::new(rect, &memory, center);
+            let projector = Projector::new(rect, &MercatorProjection, &memory, center);
             for point in &track.points {
                 let position = projector
                     .project(map_position(point.longitude, point.latitude))
@@ -1478,7 +1473,7 @@ mod tests {
                 let mut memory = MapMemory::default();
                 memory.center_at(center);
                 memory.set_zoom(zoom).unwrap();
-                let projector = Projector::new(rect, &memory, center);
+                let projector = Projector::new(rect, &MercatorProjection, &memory, center);
                 Box::new(RouteOverlay {
                     track: &track,
                     reference_track: None,
@@ -1637,7 +1632,7 @@ mod tests {
                     let mut memory = MapMemory::default();
                     memory.center_at(center);
                     memory.set_zoom(zoom).unwrap();
-                    let projector = Projector::new(rect, &memory, center);
+                    let projector = Projector::new(rect, &MercatorProjection, &memory, center);
                     expected = projector
                         .project(lon_lat(fraction.unwrap_or(1.0), 0.0))
                         .to_pos2();
@@ -1682,7 +1677,7 @@ mod tests {
                 let mut memory = MapMemory::default();
                 memory.center_at(center);
                 memory.set_zoom(zoom).unwrap();
-                let projector = Projector::new(rect, &memory, center);
+                let projector = Projector::new(rect, &MercatorProjection, &memory, center);
                 expected = projector.project(lon_lat(2.0, 0.0)).to_pos2();
                 Box::new(RouteOverlay {
                     track: &track,
