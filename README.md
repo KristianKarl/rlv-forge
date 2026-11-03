@@ -9,10 +9,10 @@ Its elevation-editing workflow was inspired by the
 [GPX Elevation Smoother web app](https://mtbsettimo.altervista.org/gpx-elevation-smoother/gpxsmoother.html).
 No browser, server, or account is required. Editing and GPX export work
 offline; the optional OpenStreetMap background uses an internet connection.
-The **Video & Incyclist** page uses an already-prepared video as a read-only
+The **Syncing** page uses an already-prepared video as a read-only
 reference. Match video frames to locations on the original GPX route, skip
 omitted sections, level elevation joins, and export a ready-to-import
-Incyclist bundle without changing video.
+Incyclist bundle on **Delivery** without changing video.
 
 The export bundle is target for the [InCyclist app](https://incyclist.com)
 
@@ -93,35 +93,57 @@ is `rlv_forge`. The release executable is `target/release/rlv-forge`.
 
 ## Workflow
 
-1. Open or drop a GPX or FIT file. Sample tracks are included in `data/`,
+1. Start on **Syncing** and use **Edit > Open GPX/FIT...** or drop a GPX or FIT file. Sample tracks are included in `data/`,
    including `2026-10-24.fit` and `2026-10-24.gpx` from the same ride.
-   The upper-right map automatically fits the route, with green/red start/end
-   markers. Hovering over chart 3 moves the red marker to the corresponding
-   route position, interpolated between samples; leaving the chart restores
-   the route-end marker. The chart's distance range is drawn in blue; other
-   track portions are muted. Drag the map to pan, scroll to zoom, and click **Fit track**
-   to restore the full-route view without changing the chart range.
-2. Choose **Auto Smooth** for one-click noise reduction on the selected
+   Open the prepared video and use **Set video start** to match its first frame
+   to the original GPX route. **Confirm video start** trims earlier samples from
+   the working copy and aligns video zero there. Add other sync landmarks/cuts
+   before smoothing, so bad elevations in discarded sections cannot influence
+   smoothing. The original GPX/FIT file is never edited.
+2. Switch to **Smoothing**, then choose **Smooth** below the elevation chart for one-click noise reduction on the selected
    range. Additional clicks apply another pass to the modified data.
-   Enable **Incyclist: soften grade transitions** for trainer-oriented
-   smoothing without imposing a maximum grade.
+   **Incyclist: soften grade transitions** and **Show original** are checked
+   by default. The former enables trainer-oriented smoothing without imposing
+   a maximum grade.
 3. Compare original (blue) and new (green) elevation/slope charts, or use
    the slope-coloured elevation profile. Hover for point details.
 4. Drag the overview's triangular handles or enter start/end kilometres to
    choose the edited range. The main chart supports scroll-to-zoom,
    drag-to-pan, **Shift+mouse wheel** to pan left/right without changing the
    zoom level, and double-click-to-reset the range. Changing the range in
-   either chart section (including numeric bounds and **Full ride**) also
-   fits the map to that portion. Manual map navigation is preserved until
-   the chart range changes or the position marker moves again.
+   either chart section (including numeric bounds and **Full ride**) selects
+   that portion for editing. Smoothing has no map; route positioning stays on
+   Syncing.
 5. Choose **Cut selected GPX section & level elevation** to remove unwanted
    recorded samples. The following retained section is shifted vertically
    to meet the preceding one, preserving its gradients. Cuts immediately
-   update the charts, distance and map; they do not edit any video.
-6. Reset to the original elevations or export the GPX (video-aligned when
-   sync points are applied). Choose a
-   destination in the native save dialog. A text preview and complete
-   clipboard copy are also available.
+   update the charts and distance; they do not edit any video.
+6. GPX is exported automatically beside the source as
+   `<source-name>-smoothed.gpx` after import and data edits, including cuts,
+   undo and redo (video-aligned when sync points are applied). The generated
+   file is replaced, never the source. View-only changes do not export.
+   Write errors are shown in the app; editing and project saving remain
+   available. **Reset The Data** re-reads the original GPX/FIT from disk,
+   replacing the working track and clearing cuts, sync points, drafts, and
+   alignment. It keeps the project save path and prepared video reference,
+   selects the full ride, and updates the automatic GPX export. A missing or
+   invalid source leaves the working data intact and shows an error. Reset
+   can be undone and is the last control on Smoothing; no export metadata or
+   GPX text preview is shown.
+
+The connected top tabs are **Syncing**, **Smoothing**, and **Delivery**. Click
+to select a tab, or use Left/Right and Home/End while a tab has keyboard focus.
+All remain accessible with missing-input guidance. **File** contains project operations
+and Exit; **Edit** contains Undo/Redo and the current page's import action.
+Cuts and sync points have resizable, scrollable right sidebars on their
+respective pages.
+Smoothing has no map; the Syncing map matches the video viewport.
+
+Numeric edit boxes support exponential dragging: small movements give fine
+adjustments, and sensitivity doubles every 50 logical pixels from the click.
+Returning to the click restores the starting value; holding still stops
+changes. Hold Shift when starting a drag for finer adjustment (the mode stays
+fixed until release); clicking to type still works.
 
 The interface exposes automatic smoothing only, without manual smoothing
 parameters or a separate Instructions page. Slopes are percentages.
@@ -142,9 +164,9 @@ not FIT. The imported FIT file is not changed.
 
 ### Save and resume editing
 
-Use **Save project** (**Ctrl/Cmd+S**) to save an editable `.gpxproj` file,
-or **Save project as...** (**Ctrl/Cmd+Shift+S**) for a separate copy.
-**Open project...**, dropping a project onto the app, or opening it from the
+Use **File > Save project** (**Ctrl/Cmd+S**) to save an editable `.gpxproj` file,
+or **File > Save project as...** (**Ctrl/Cmd+Shift+S**) for a separate copy.
+**File > Open project...**, dropping a project onto the app, or opening it from the
 command line restores the work after restarting.
 
 RLV Forge keeps the `.gpxproj` extension and can open projects saved by its
@@ -160,8 +182,8 @@ stored in the project.
 
 The GPX (including converted FIT imports) is embedded, so its original file
 is not needed to resume. Video is referenced by its path, never embedded or changed; keep the prepared video
-available. If it has moved, reopen it with **Open prepared video** on the video
-page; the app preserves sync points when the replacement's duration supports
+available. If it has moved, reopen it with **Edit > Open prepared video...** on
+**Syncing**; the app preserves sync points when the replacement's duration supports
 them. Project saves replace the destination atomically and cannot overwrite
 the referenced GPX/FIT or video. Invalid project files leave the current work intact.
 Before opening another file or closing with unsaved work, choose **Save project
@@ -170,11 +192,12 @@ bundle is separate from saving an editable project.
 
 ### Automatic smoothing
 
-**Auto Smooth** prioritizes preserving the route, not making a trainer ride
+**Smooth** prioritizes preserving the route, not making a trainer ride
 artificially flat. It operates on the current elevations in the selected
 chart range and runs in a background task. The status bar reports the number
-of changed points and the largest elevation change. Reset restores the
-imported elevations.
+of changed points and the largest elevation change. Reset re-imports the
+original file from disk, discarding track edits rather than only restoring
+elevations.
 
 The algorithm first groups duplicate locations by median elevation, then
 resamples each continuous selected track segment onto an approximately
@@ -228,9 +251,27 @@ file, or closing the app.
 ## Prepared video, GPX cuts and Incyclist pairing
 
 1. Prepare the video outside this app, including any removed stops or ride
-   sections. Load and smooth the corresponding GPX.
-2. Open the prepared video on **Video & Incyclist**. The video and map have
-   equally sized viewports. Pause on a recognizable frame and wait for its
+   sections. Import the corresponding GPX/FIT working copy on **Syncing**.
+2. On **Syncing**, use **Edit > Open prepared video...**. The video and map have
+   equally sized viewports with their controls directly below them. The track
+   is shared with **Smoothing**, but synchronization comes first.
+   Press **Set video start** to freeze the first frame at 0:00. Move the GPX
+   marker to that frame's route location, then **Confirm video start** to trim
+   earlier GPX data and anchor video zero in one undoable edit. Confirmation
+   waits for the first frame to load; **Cancel picking** leaves data unchanged.
+   The **Video start** row keeps video time fixed at zero; editing its GPX time
+   can move the start earlier or later without altering the source file.
+   Use **Set video end** to freeze the final frame, choose its matching GPX
+   position, then **Confirm video end** to trim later GPX data in one undoable
+   edit. The GPX marker keeps its current position when the video jumps; it does
+   not default to the GPX end or a saved endpoint. Confirmation waits for that
+   frame's preview. The trailing route is
+   previewed in red, and cancellation leaves data unchanged. The **Video end**
+   row fixes video time at the final frame and lets you revise the GPX endpoint.
+   Both boundary tools preserve zoom and modify only the working copy.
+   Export holds the final GPX location through the final frame's display time,
+   retaining full video coverage without keeping unwanted trailing route data.
+   Then pause on another recognizable frame and wait for its
    preview, then press **Pick Landmark**. The button stays pressed and the
    video, its slider, playback buttons and keyboard playback are locked.
    Use the map's **Original GPX seconds** slider, numeric field, or **-10 s /
@@ -243,23 +284,39 @@ file, or closing the app.
    row and unlock the video, or **Cancel picking** to discard the selection. Orange numbered
    pins identify created points.
 3. Repeat at other landmarks, preferably near both ends. The **Sync points**
-   table lets you edit the video/original-GPX seconds and point type, seek to
-   a frame, or remove a row. Newly picked points apply automatically. For manual
+   table lets you edit landmarks' video/original-GPX seconds and point type,
+   seek to a frame, or remove a row. Cuts appear as one row with **Video seconds**
+   and **Duration**: the original GPX seconds removed, not video duration.
+   Editing duration keeps the GPX start fixed; hover over **Cut** to see its
+   original GPX bounds. Editing video time moves both video boundaries together,
+   preserving their gap; removing the row removes both boundaries.
+   The map's current GPX marker previews valid table edits at the unchanged
+   video time, so adjusting a cut's duration also updates your position farther
+   along the route. Sliders and exports keep using the applied timing until you
+   apply; cancelling restores the applied map position.
+   Newly picked points apply automatically. For manual
    table edits, choose **Apply sync points** to commit the changes
    or **Cancel sync changes** to discard the draft. One landmark sets an offset;
    multiple landmarks interpolate timing between them to correct drift.
+   After start alignment and cuts, use **Smoothing** to process only the retained data.
    Outside the landmarks, the nearest non-cut interval's rate is used
    (one GPX second per video second when there is no such interval).
-   To skip a section already removed from the video, add **Pick before cut**
-   on the last frame before the edit and **Pick after cut** on the first frame
-   after it. These buttons use the same press-to-freeze, position-GPX,
-   press-again-to-create interaction and apply automatically. A single boundary
-   acts as an alignment landmark until its partner is added. The paired points
-   must be consecutive in video order and advance in original GPX time; adding
-   the partner automatically removes and levels the intervening GPX. The red
-   marker holds the Before location until the After timestamp, then jumps;
+   To skip a section already removed from the video, position the video and GPX
+   at its start and press **Create cut**. The button stays selected as
+   **Done create cut**, capturing both times and freezing the video. Move only
+   the GPX to the end of the omitted section, then press **Done create cut**.
+   Both boundaries apply together as one undoable edit: the second uses the
+   chosen GPX end time and the captured video time plus one frame. **Cancel
+   picking** discards the unfinished cut. While choosing the end, a thick red
+   line previews the original route section to be removed; it clears when the
+   cut is completed or cancelled. Invalid selections leave creation
+   active for correction; a following playable video frame is required.
+   The paired points must be consecutive in video order and advance in original
+   GPX time. Applying the pair removes and levels the intervening GPX. The red
+   marker holds the start location for one frame, then jumps to the end.
+   Older unpaired boundaries remain editable as alignment landmarks;
    ordinary landmarks never infer removed sections.
-4. Both maps retain the full imported route in grey, including removed
+4. The Syncing map retains the full imported route in grey, including removed
    sections; retained selections are highlighted in blue. **Fit track** fits
    the full original route. The **GPX seconds** slider under the map and the
    full-width video slider are linked through the applied sync mapping.
@@ -268,6 +325,8 @@ file, or closing the app.
    then catches up to the final position after release.
    Each seek pans the map to center the red marker without changing
    its zoom, including when jumping over cuts or independently picking landmarks.
+   Creating and applying landmarks or sync cuts also preserves the current zoom;
+   use **Fit track** to explicitly fit the full route again.
    You can still drag to explore; the next seek recenters the marker.
    Scrolling the page keeps the route, sync pins and picking aligned with the
    map tiles, including when the map is only partly visible.
@@ -306,15 +365,27 @@ file, or closing the app.
    the smoothed, cut track. The frame stays in place outside GPX coverage.
    Timeline fields, map status and coverage hints reserve consistent space so
    scrubbing or loading a new preview cannot shift the sliders or other controls.
-5. Enter an optional country and new bundle-folder name, then **Export
+5. On **Delivery**, enter an optional country and new bundle-folder name, then **Export
    Incyclist bundle...**. The app copies the **entire video byte-for-byte**:
    codec, container, frame rate, audio and all other bytes stay unchanged.
    Its extension is preserved (`ride.mp4`, `ride.mov`, etc.). The GPX is
    aligned to the full video interval; export fails if GPX coverage is
-   insufficient. A duration warning helps identify remaining cuts or
-   alignment problems. Standalone GPX export and preview use the same
+   insufficient. With sync points applied, **Export coverage needs attention**
+   shows the uncovered video ranges, missing seconds, and the first/last
+   sync points and extrapolated timing rates responsible. Boundary landmarks
+   are suggested automatically where they can be added without conflicting
+   with existing landmarks or cut pairs. Choose **Review suggested boundary
+   landmarks** to validate and stage them in the sync table, then verify the
+   footage on **Syncing** and **Apply sync points** (or **Cancel sync changes**).
+   Suggestions assume the first/last retained GPX location matches the video
+   boundary; they are not automatic visual matches and never change the video.
+   Automatic GPX export uses the same
    synchronized GPX, including its video-relative timestamps. Existing
-   bundle folders are never overwritten.
+   bundle folders are never overwritten. An export progress bar reports
+   progress. **Also create a ZIP archive** (unchecked by default) additionally
+   creates `<bundle-folder>.zip` beside the normal bundle directory. The ZIP
+   contains the same three files and supports large videos without
+   recompressing them; existing archives are never overwritten.
    GPX timestamps and cut markers use the same millisecond rounding, including
    when landmarks fall on fractional-frame times. Cut markers store total
    seconds (for example, `0:00:502.143`) to match Incyclist's exact timestamp
@@ -326,19 +397,22 @@ file, or closing the app.
 ### Manual cut and alignment fallback
 
 Use the chart range and **Cut selected GPX section & level elevation** for
-recorded-sample cuts, including untimed tracks/routes. For timed cuts,
-including stationary stops, enter **GPX in/out** on the video page and choose
-**Cut GPX section & level elevation**. These input fields use the **current,
-shortened GPX clock**, not the video clock. The small **Use video time**
-buttons copy video seconds directly, without applying alignment.
+recorded-sample cuts on **Smoothing**, including untimed tracks/routes.
+On **Syncing**, use **Create cut** to select an omitted original-GPX interval,
+including stationary stops. The older manual GPX in/out controls and their
+footer hints are no longer shown on Syncing; alignment controls remain available.
 
-Successful manual cuts appear in the **GPX cuts** table on both pages.
-Its editable time bounds use the **original, uncut GPX clock**, with whole-second
-editing. Revising an earlier row does not change later rows' reference times;
+Successful manual cuts appear in the **GPX cuts** table only in the
+**Smoothing** sidebar, not on Syncing.
+Timed rows show **GPX time + Duration**, using the **original, uncut GPX clock**
+with millisecond precision. Moving the start preserves duration; editing
+duration moves the end. Smoothing has no map; use Syncing for visual alignment.
+Revising an earlier row does not change later rows' reference times;
 overlaps are combined. **Apply cut changes** rebuilds from the full smoothed
 source; **Cancel cut changes** discards the draft. Smoothing before and after
-cutting is retained. Untimed distance rows instead use the sequential distance
-range before each cut. Applied sync-derived cuts remain in the Sync points
+cutting is retained. Untimed rows show starting distance and removed distance
+in kilometres, relative to the sequential track before each cut.
+Applied sync-derived cuts remain in the Sync points
 table, separate from manual cuts. Manual cuts cannot remove a sync anchor.
 Undo/redo restores applied tables and tracks together; opening a new GPX clears
 both. Apply or cancel one table's draft before editing the other.

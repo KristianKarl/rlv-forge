@@ -1,3 +1,4 @@
+use crate::numeric::DragValue;
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
 };
@@ -20,6 +21,128 @@ const ORIGINAL: Color32 = Color32::from_rgb(40, 85, 210);
 const GREEN: Color32 = Color32::from_rgb(25, 145, 75);
 const INK: Color32 = Color32::from_rgb(51, 51, 51);
 const BACKGROUND: Color32 = Color32::from_rgb(252, 252, 250);
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) enum Page {
+    Smoothing,
+    #[default]
+    Syncing,
+    Delivery,
+}
+
+fn page_tabs(ui: &mut egui::Ui, page: &mut Page) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let height =
+        (ui.text_style_height(&egui::TextStyle::Button) + 18.0).max(ui.spacing().interact_size.y);
+    let (strip, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::Role::TabList));
+    let border = ui.visuals().widgets.noninteractive.bg_stroke;
+    ui.painter()
+        .line_segment([strip.left_bottom(), strip.right_bottom()], border);
+    let tabs = [
+        (Page::Syncing, "Syncing"),
+        (Page::Smoothing, "Smoothing"),
+        (Page::Delivery, "Delivery"),
+    ];
+    let mut left = strip.left();
+    for (index, (value, label)) in tabs.iter().enumerate() {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label.to_string(), font.clone(), INK);
+        let rect = Rect::from_min_size(
+            pos2(left, strip.top()),
+            vec2(galley.size().x + 36.0, height),
+        );
+        left = rect.right() + 2.0;
+        let response = ui.interact(
+            rect,
+            ui.scope_id().with(("page-tab", value)),
+            Sense::click(),
+        );
+        if response.clicked() {
+            *page = *value;
+            response.request_focus();
+            ui.ctx().request_repaint();
+        }
+        if response.has_focus() && ui.is_enabled() {
+            let target = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                    Some((index + 1) % tabs.len())
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                    Some((index + tabs.len() - 1) % tabs.len())
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                    Some(0)
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                    Some(tabs.len() - 1)
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+            if let Some(target) = target {
+                *page = tabs[target].0;
+                let id = ui.scope_id().with(("page-tab", *page));
+                ui.memory_mut(|memory| {
+                    // Tab navigation replaces egui's spatial arrow-key focus search.
+                    memory.move_focus(egui::FocusDirection::None);
+                    memory.request_focus(id);
+                });
+                ui.ctx().request_repaint();
+            }
+        }
+        let selected = *page == *value;
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::Tab, ui.is_enabled(), selected, label)
+        });
+        let visuals = ui.style().interact(&response);
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius {
+                nw: 6,
+                ne: 6,
+                sw: 0,
+                se: 0,
+            },
+            if selected {
+                BACKGROUND
+            } else {
+                visuals.bg_fill
+            },
+            border,
+            StrokeKind::Inside,
+        );
+        if selected {
+            ui.painter().line_segment(
+                [
+                    rect.left_bottom() + vec2(1.0, 0.0),
+                    rect.right_bottom() - vec2(1.0, 0.0),
+                ],
+                Stroke::new(2.0, BACKGROUND),
+            );
+        }
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            font.clone(),
+            if selected { BLUE } else { visuals.text_color() },
+        );
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                rect.shrink(4.0),
+                2.0,
+                ui.visuals().selection.stroke,
+                StrokeKind::Inside,
+            );
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Chart {
@@ -182,13 +305,16 @@ enum Job {
         track: Track,
         path: PathBuf,
     },
+    Reloaded {
+        track: Track,
+        path: PathBuf,
+    },
     Saved(PathBuf),
     ProjectSaved(PathBuf),
     ProjectLoaded {
         project: Box<crate::project::LoadedProject>,
         path: PathBuf,
     },
-    Preview(String),
     AutoSmoothed {
         track: Track,
         source: Track,
@@ -223,7 +349,7 @@ struct EditState {
     chart: Chart,
     show_original: bool,
     trainer_mode: bool,
-    studio_open: bool,
+    page: Page,
     studio: crate::studio::Settings,
     map: crate::map::ViewState,
     project_path: Option<PathBuf>,
@@ -243,7 +369,6 @@ pub struct RlvForge {
     show_original: bool,
     status: String,
     error: Option<String>,
-    preview: Option<String>,
     modified_slopes: Vec<f64>,
     original_slopes: Vec<f64>,
     handle: Option<usize>,
@@ -251,15 +376,17 @@ pub struct RlvForge {
     confirm: Option<Pending>,
     map: crate::map::TrackMap,
     studio: crate::studio::Studio,
-    studio_open: bool,
+    page: Page,
     trainer_mode: bool,
     pending_video: Option<PathBuf>,
     history: History<EditState>,
     project_path: Option<PathBuf>,
     project_dirty: bool,
+    auto_export_due: Option<std::time::Instant>,
 }
 
 enum Pending {
+    New,
     Open(Option<PathBuf>),
     OpenProject,
     Reset,
@@ -309,7 +436,6 @@ impl RlvForge {
             show_original: true,
             status: "Open a GPX or FIT file or drop one anywhere in this window.".into(),
             error: None,
-            preview: None,
             modified_slopes: Vec::new(),
             original_slopes: Vec::new(),
             handle: None,
@@ -317,12 +443,13 @@ impl RlvForge {
             confirm: None,
             map: crate::map::TrackMap::default(),
             studio: crate::studio::Studio::default(),
-            studio_open: false,
-            trainer_mode: false,
+            page: Page::Syncing,
+            trainer_mode: true,
             pending_video: video,
             history: History::default(),
             project_path: None,
             project_dirty: false,
+            auto_export_due: None,
         }
     }
 
@@ -389,7 +516,11 @@ impl RlvForge {
             || ((self.studio.dirty || self.project_dirty)
                 && matches!(
                     pending,
-                    Pending::Open(_) | Pending::OpenProject | Pending::Close
+                    Pending::New
+                        | Pending::Open(_)
+                        | Pending::OpenProject
+                        | Pending::Reset
+                        | Pending::Close
                 ))
         {
             self.confirm = Some(pending);
@@ -400,23 +531,56 @@ impl RlvForge {
 
     fn perform(&mut self, pending: Pending, ctx: &egui::Context) {
         match pending {
+            Pending::New => {
+                self.studio.pause();
+                *self = Self::empty(None);
+            }
             Pending::Open(path) => self.open(path, ctx),
             Pending::OpenProject => self.open_kind(None, ctx, true),
             Pending::Reset => {
-                if let Some(track) = &mut self.track {
-                    Arc::make_mut(track).reset();
-                    if let Some(source) = &mut self.cut_source {
-                        Arc::make_mut(source).reset();
-                    }
-                    self.selection = [0.0, track.total_distance()];
-                    self.modified_slopes = track.slopes(false);
-                    self.preview = None;
-                    self.dirty = true;
-                    self.status = "Original elevations restored; the full ride is selected.".into();
-                }
+                self.auto_export_due = None;
+                let Some(path) = self.source_path.clone() else {
+                    self.error = Some("Cannot reset without the original source path. Open the original GPX or FIT file first.".into());
+                    return;
+                };
+                self.studio.pause();
+                self.status = format!("Re-reading original track {}...", path.display());
+                self.spawn(ctx, move || {
+                    Ok(Job::Reloaded {
+                        track: Track::read(&path)?,
+                        path,
+                    })
+                });
             }
             Pending::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
+    }
+
+    fn install_source_track(&mut self, track: Track, path: PathBuf) {
+        self.hover_distance = None;
+        self.handle = None;
+        self.selection = [0.0, track.total_distance()];
+        self.filename = format!(
+            "{}-smoothed.gpx",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        );
+        self.name = track.name.clone();
+        self.description = track.description.clone();
+        self.original_slopes = track.slopes(true);
+        self.modified_slopes = self.original_slopes.clone();
+        self.status = format!(
+            "Loaded {} points from {}.",
+            track.points.len(),
+            path.display()
+        );
+        self.source_path = Some(path);
+        self.studio.set_track(&track);
+        let track = Arc::new(track);
+        self.map.set_reference_track(track.clone());
+        self.cut_source = Some(track.clone());
+        self.track = Some(track);
+        self.project_dirty = true;
+        self.auto_export_due = Some(std::time::Instant::now());
     }
 
     fn poll(&mut self, ctx: &egui::Context) -> bool {
@@ -431,30 +595,15 @@ impl RlvForge {
         let mut project_clean = false;
         match result {
             Ok(Job::Loaded { track, path }) => {
-                self.hover_distance = None;
-                self.selection = [0.0, track.total_distance()];
-                self.filename = format!(
-                    "{}-smoothed.gpx",
-                    path.file_stem().unwrap_or_default().to_string_lossy()
-                );
-                self.name = track.name.clone();
-                self.description = track.description.clone();
-                self.original_slopes = track.slopes(true);
-                self.modified_slopes = self.original_slopes.clone();
-                self.status = format!(
-                    "Loaded {} points from {}.",
-                    track.points.len(),
-                    path.display()
-                );
-                self.source_path = Some(path);
-                self.studio.set_track(&track);
-                let track = Arc::new(track);
-                self.map.set_reference_track(track.clone());
-                self.cut_source = Some(track.clone());
-                self.track = Some(track);
-                self.preview = None;
+                self.install_source_track(track, path);
+                self.page = Page::Syncing;
                 self.dirty = false;
                 self.project_path = None;
+            }
+            Ok(Job::Reloaded { track, path }) => {
+                self.install_source_track(track, path);
+                self.dirty = true;
+                self.status.push_str(" Working data replaced; cuts and sync points cleared. Undo restores the previous data.");
             }
             Ok(Job::ProjectLoaded { project, path }) => {
                 let project = *project;
@@ -471,10 +620,14 @@ impl RlvForge {
                 self.chart = document.chart;
                 self.show_original = document.show_original;
                 self.trainer_mode = document.trainer_mode;
-                self.studio_open = document.studio_open;
+                self.page = document.page.unwrap_or(if document.studio_open {
+                    Page::Syncing
+                } else {
+                    Page::Smoothing
+                });
+                self.auto_export_due = None;
                 self.original_slopes = self.track.as_ref().unwrap().slopes(true);
                 self.modified_slopes = self.track.as_ref().unwrap().slopes(false);
-                self.preview = None;
                 self.hover_distance = None;
                 self.handle = None;
                 self.pending_video = None;
@@ -504,20 +657,16 @@ impl RlvForge {
             }
             Ok(Job::Cut { track, start }) => self.apply_cut(Ok(track), start),
             Ok(Job::RebuiltCuts { track, cuts }) => match self.studio.commit_cuts(&track, cuts) {
-                Ok(()) => self.install_cut_track(track),
+                Ok(()) => self.install_cut_track(track, false),
                 Err(error) => self.error = Some(error),
             },
             Ok(Job::Synced { track, points }) => match self.studio.commit_sync(&track, points) {
                 Ok(()) => {
-                    self.install_cut_track(track);
+                    self.install_cut_track(track, false);
                     self.status = "Sync points applied. Map and timelines follow the mapping; GPX jumps are levelled and video is unchanged.".into();
                 }
                 Err(error) => self.error = Some(error),
             },
-            Ok(Job::Preview(xml)) => {
-                self.preview = Some(xml);
-                self.status = "GPX preview ready. Export GPX saves the full file without browser size limits.".into();
-            }
             Ok(Job::AutoSmoothed {
                 track,
                 source,
@@ -529,16 +678,16 @@ impl RlvForge {
                     self.modified_slopes = track.slopes(false);
                     self.track = Some(Arc::new(track));
                     self.cut_source = Some(Arc::new(source));
-                    self.preview = None;
                     self.dirty = true;
+                    self.auto_export_due = Some(std::time::Instant::now());
                     let mode = if trainer {
                         "Incyclist smoothing"
                     } else {
-                        "Auto Smooth"
+                        "Smooth"
                     };
                     self.status = format!("{mode} updated {changed} points (largest change: {max_shift:.2} m). Endpoints preserved; no slope limits applied.");
                 } else {
-                    self.status = "Auto Smooth made no changes: the selected data is already smooth or too short/sparse for reliable smoothing.".into();
+                    self.status = "Smooth made no changes: the selected data is already smooth or too short/sparse for reliable smoothing.".into();
                 }
             }
             Ok(Job::Cancelled) => self.status = "File dialog cancelled.".into(),
@@ -576,7 +725,8 @@ impl RlvForge {
         document.chart = self.chart;
         document.show_original = self.show_original;
         document.trainer_mode = self.trainer_mode;
-        document.studio_open = self.studio_open;
+        document.studio_open = self.page == Page::Syncing;
+        document.page = Some(self.page);
         Ok(document)
     }
 
@@ -624,7 +774,7 @@ impl RlvForge {
         });
     }
 
-    fn export(&mut self, ctx: &egui::Context, preview: bool) {
+    fn export(&mut self, ctx: &egui::Context) {
         let Some(track) = &self.track else { return };
         let result = if let Some(mapping) = self.studio.mapping() {
             self.cut_source
@@ -645,30 +795,13 @@ impl RlvForge {
                 return;
             }
         };
-        let filename = self.filename.clone();
         let source = self.source_path.clone();
         let video = self.studio.video_path();
-        self.status = if preview {
-            "Preparing GPX preview..."
-        } else {
-            "Saving GPX..."
-        }
-        .into();
+        self.status = "Saving GPX...".into();
         self.spawn(ctx, move || {
-            if preview {
-                return Ok(Job::Preview(xml));
-            }
-            let mut dialog = rfd::FileDialog::new()
-                .add_filter("GPX tracks", &["gpx"])
-                .set_file_name(&filename);
-            if let Some(parent) = source.as_ref().and_then(|p| p.parent()) {
-                dialog = dialog.set_directory(parent);
-            }
-            let Some(path) = dialog.save_file() else {
-                return Ok(Job::Cancelled);
-            };
-            // The save dialog confirms overwrite; write only after the user chooses a destination.
-            save_gpx(&path, &xml, video.as_deref())?;
+            let source = source.ok_or("Cannot automatically export GPX without a source path. Import a GPX or FIT file first.")?;
+            let path = automatic_gpx_path(&source)?;
+            save_automatic_gpx(&path, &source, &xml, video.as_deref())?;
             Ok(Job::Saved(path))
         });
     }
@@ -715,9 +848,9 @@ impl RlvForge {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.label("2. Smooth the data:");
+        ui.label("Smooth the selected range:");
         ui.horizontal_wrapped(|ui| {
-            if ui.add(egui::Button::new(egui::RichText::new("Auto Smooth").color(Color32::WHITE)).fill(BLUE))
+            if ui.add(egui::Button::new(egui::RichText::new("Smooth").color(Color32::WHITE)).fill(BLUE))
                 .on_hover_text("Remove isolated spikes and short-distance elevation noise in the selected range. Uses distance-based filtering, preserves endpoints and sustained climbs, and applies no slope limits.")
                 .clicked() {
                 self.auto_smooth(ui.ctx());
@@ -726,20 +859,15 @@ impl RlvForge {
         });
         ui.checkbox(&mut self.trainer_mode, "Incyclist: soften grade transitions")
             .on_hover_text("Adds distance-weighted grade smoothing over a 25 m radius, retaining endpoint elevations and sustained climbs. No grade caps. Coordinates, timestamps and point count are unchanged.");
+        ui.checkbox(&mut self.show_original, "Show original");
     }
 
-    fn import_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label("1. Select a GPX or FIT file:");
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Open GPX/FIT...").clicked() {
-                self.request(Pending::Open(None), ctx);
-            }
-            if let Some(path) = &self.source_path {
-                ui.label(path.display().to_string());
-            } else {
-                ui.label("Or drop a .gpx or .fit file into this window.");
-            }
-        });
+    fn source_summary(&self, ui: &mut egui::Ui) {
+        if let Some(path) = &self.source_path {
+            ui.add(egui::Label::new(path.display().to_string()).truncate());
+        } else if self.track.is_none() {
+            ui.label("Use Edit > Open GPX/FIT... or drop a track into this window.");
+        }
         if let Some(track) = &self.track {
             if track.missing_elevations > 0 {
                 ui.colored_label(Color32::from_rgb(160, 90, 0), format!(
@@ -749,45 +877,12 @@ impl RlvForge {
         }
     }
 
-    fn top_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let width = ui.available_width();
-        let map_width = (width * 0.36).clamp(260.0, 420.0);
-        let left_width = width - map_width - ui.spacing().item_spacing.x;
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                vec2(left_width, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_width(left_width);
-                    self.import_controls(ui, ctx);
-                    ui.add_space(8.0);
-                    ui.add_enabled_ui(self.track.is_some(), |ui| self.controls(ui));
-                },
-            );
-            ui.allocate_ui_with_layout(
-                vec2(map_width, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_width(map_width);
-                    self.map.show(
-                        ui,
-                        self.track.as_deref(),
-                        self.selection,
-                        self.hover_distance,
-                    );
-                },
-            );
-        });
-    }
-
     fn charts(&mut self, ui: &mut egui::Ui) {
         self.hover_distance = None;
-        ui.label("3. Check the resulting elevation and slope. Hover over the chart for details:");
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.chart, Chart::Elevation, "Elevation Chart");
             ui.selectable_value(&mut self.chart, Chart::Slope, "Slope Chart");
             ui.selectable_value(&mut self.chart, Chart::Profile, "Elevation Profile");
-            ui.checkbox(&mut self.show_original, "Show original");
         });
         let (response, painter) =
             ui.allocate_painter(vec2(ui.available_width(), 285.0), Sense::click_and_drag());
@@ -892,8 +987,9 @@ impl RlvForge {
                 BLUE,
             );
         }
+        ui.add_enabled_ui(self.track.is_some(), |ui| self.controls(ui));
         ui.add_space(6.0);
-        ui.label("4. Drag the triangles below to select the portion to smooth. Scroll the main chart to zoom; Shift+scroll or drag to pan.");
+        ui.label("Drag the triangles below to select the portion to smooth. Scroll the main chart to zoom; Shift+scroll or drag to pan.");
         self.overview(ui);
     }
 
@@ -970,7 +1066,7 @@ impl RlvForge {
             let mut end = self.selection[1] / 1000.0;
             let start_changed = ui
                 .add(
-                    egui::DragValue::new(&mut start)
+                    DragValue::new(&mut start)
                         .speed(0.01)
                         .range(0.0..=end)
                         .suffix(" km"),
@@ -979,7 +1075,7 @@ impl RlvForge {
             ui.label("to");
             let end_changed = ui
                 .add(
-                    egui::DragValue::new(&mut end)
+                    DragValue::new(&mut end)
                         .speed(0.01)
                         .range(start..=total / 1000.0)
                         .suffix(" km"),
@@ -1034,9 +1130,6 @@ impl RlvForge {
             }
         }
         ui.small("Cut removes the selected recorded samples, closes distance/time gaps, and levels the following elevations without changing their gradients.");
-        if let Some(cuts) = self.studio.show_cuts(ui) {
-            self.replace_cuts(cuts, ui.ctx());
-        }
     }
 
     fn cut_time(&mut self, cut: Clip, ctx: &egui::Context) {
@@ -1070,7 +1163,7 @@ impl RlvForge {
                 if self.cut_source.is_none() {
                     self.cut_source = self.track.clone();
                 }
-                self.install_cut_track(track);
+                self.install_cut_track(track, true);
             }
             Err(error) => self.error = Some(error),
         }
@@ -1130,15 +1223,19 @@ impl RlvForge {
         });
     }
 
-    fn install_cut_track(&mut self, track: Track) {
+    fn install_cut_track(&mut self, track: Track, refit_map: bool) {
         self.selection = [0.0, track.total_distance()];
         self.original_slopes = track.slopes(true);
         self.modified_slopes = track.slopes(false);
         self.track = Some(Arc::new(track));
-        self.preview = None;
         self.hover_distance = None;
-        self.map.reset_view();
+        if refit_map {
+            self.map.reset_view();
+        } else {
+            self.map.retain_view(self.selection);
+        }
         self.dirty = true;
+        self.auto_export_due = Some(std::time::Instant::now());
         self.error = None;
         self.status = "GPX cuts applied and elevation joins levelled. Following gradients preserved; video unchanged. Undo restores the previous cuts.".into();
     }
@@ -1155,7 +1252,7 @@ impl RlvForge {
             chart: self.chart,
             show_original: self.show_original,
             trainer_mode: self.trainer_mode,
-            studio_open: self.studio_open,
+            page: self.page,
             studio: self.studio.settings(),
             map: self.map.view_state(),
             project_path: self.project_path.clone(),
@@ -1164,8 +1261,11 @@ impl RlvForge {
 
     fn restore_state(&mut self, state: EditState) {
         let content_changed = self.track != state.track
+            || self.cut_source != state.cut_source
+            || self.source_path != state.source_path
             || self.name != state.name
-            || self.description != state.description;
+            || self.description != state.description
+            || self.studio.export_changed(&state.studio);
         self.track = state.track;
         self.cut_source = state.cut_source;
         self.filename = state.filename;
@@ -1177,7 +1277,7 @@ impl RlvForge {
         self.chart = state.chart;
         self.show_original = state.show_original;
         self.trainer_mode = state.trainer_mode;
-        self.studio_open = state.studio_open;
+        self.page = state.page;
         self.studio.restore(state.studio, self.track.as_deref());
         self.map.restore_view(state.map);
         self.original_slopes = self
@@ -1188,11 +1288,13 @@ impl RlvForge {
             .track
             .as_ref()
             .map_or_else(Vec::new, |track| track.slopes(false));
-        self.preview = None;
         self.hover_distance = None;
         self.handle = None;
         self.error = None;
         self.dirty = self.track.is_some() && (self.dirty || content_changed);
+        if content_changed {
+            self.auto_export_due = Some(std::time::Instant::now());
+        }
     }
 
     fn undo_redo(&mut self, redo: bool) {
@@ -1213,68 +1315,23 @@ impl RlvForge {
         }
     }
 
-    fn export_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.label("5. Try different smoothing:");
-            if ui.button("Reset The Data").clicked() {
-                self.request(Pending::Reset, ctx);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("6.");
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("Export GPX").color(Color32::WHITE))
-                        .fill(BLUE),
-                )
-                .clicked()
-            {
-                self.export(ctx, false);
-            }
-            ui.label(if self.dirty {
-                "Unsaved changes"
-            } else {
-                "All processing stays on your computer."
-            });
-        });
-        egui::Grid::new("export").num_columns(2).show(ui, |ui| {
-            ui.label("File name:");
-            ui.text_edit_singleline(&mut self.filename);
-            ui.end_row();
-            ui.label("GPX name:");
-            let name_changed = ui
-                .add(egui::TextEdit::singleline(&mut self.name).desired_width(550.0))
-                .changed();
-            ui.end_row();
-            ui.label("Description:");
-            let description_changed = ui
-                .add(egui::TextEdit::singleline(&mut self.description).desired_width(550.0))
-                .changed();
-            ui.end_row();
-            if name_changed || description_changed {
-                self.dirty = true;
-                self.preview = None;
-            }
-        });
-        ui.add_space(5.0);
-        ui.collapsing("7. Resulting GPX (optional text preview)", |ui| {
-            if ui.button("Generate GPX preview").clicked() { self.export(ctx, true); }
-            if let Some(xml) = &self.preview {
-                ui.label(format!("{} bytes. Export GPX always writes the complete document.", xml.len()));
-                if ui.button("Copy complete GPX").clicked() { ctx.copy_text(xml.clone()); }
-                // Keep the editor responsive for multi-megabyte documents; copying/export is complete.
-                let end = xml.char_indices().nth(20_000).map_or(xml.len(), |(i, _)| i);
-                let mut text = &xml[..end];
-                ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY).desired_rows(12));
-                if end < xml.len() { ui.label("Preview truncated to 20,000 characters; Copy complete GPX includes everything."); }
-            }
-        });
+    fn apply_studio_edit(&mut self, edit: Option<crate::studio::Edit>, ctx: &egui::Context) {
+        match edit {
+            Some(crate::studio::Edit::ReplaceCuts(cuts)) => self.replace_cuts(cuts, ctx),
+            Some(crate::studio::Edit::Sync(points)) => self.apply_sync(points, ctx),
+            None => {}
+        }
+    }
+
+    fn reset_control(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui.button("Reset The Data").clicked() {
+            self.request(Pending::Reset, ctx);
+        }
     }
 }
 
-impl eframe::App for RlvForge {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl RlvForge {
+    fn show(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
         let mut before = self.edit_state();
         let mut history_action = false;
@@ -1289,11 +1346,11 @@ impl eframe::App for RlvForge {
         self.studio.poll(ctx);
         if self.worker.is_none() && !self.studio.busy() {
             if let Some(video) = self.pending_video.take() {
-                self.studio_open = true;
+                self.page = Page::Syncing;
                 self.studio.open_video(ctx, Some(video));
             }
         }
-        if !self.studio_open {
+        if self.page != Page::Syncing {
             self.studio.pause();
         }
         if ctx.input(|i| i.viewport().close_requested())
@@ -1349,67 +1406,127 @@ impl eframe::App for RlvForge {
                 ctx.request_repaint();
             }
         }
-        egui::Panel::top("header").show(root, |ui| {
-            ui.add_space(8.0);
-            ui.heading(egui::RichText::new("RLV Forge").size(28.0).color(BLUE));
-            ui.add_space(6.0);
-            ui.add_enabled_ui(
-                self.worker.is_none() && !self.studio.busy() && self.confirm.is_none(),
-                |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Open project...").clicked() {
-                            self.request(Pending::OpenProject, ctx);
-                        }
-                        if ui
-                            .add_enabled(self.track.is_some(), egui::Button::new("Save project"))
-                            .clicked()
-                        {
-                            self.save_project(ctx, false);
-                        }
-                        if ui
-                            .add_enabled(
-                                self.track.is_some(),
-                                egui::Button::new("Save project as..."),
+        egui::Panel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(BACKGROUND)
+                    .inner_margin(egui::Margin {
+                        left: 8,
+                        right: 8,
+                        top: 4,
+                        bottom: 0,
+                    }),
+            )
+            .show(root, |ui| {
+                ui.add_enabled_ui(
+                    self.worker.is_none() && !self.studio.busy() && self.confirm.is_none(),
+                    |ui| {
+                        egui::MenuBar::new().ui(ui, |ui| {
+                            ui.menu_button("File", |ui| {
+                                if ui.button("New project").clicked() {
+                                    self.request(Pending::New, ctx);
+                                    ui.close();
+                                }
+                                if ui.button("Open project...").clicked() {
+                                    self.request(Pending::OpenProject, ctx);
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        self.track.is_some(),
+                                        egui::Button::new("Save project"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.save_project(ctx, false);
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        self.track.is_some(),
+                                        egui::Button::new("Save project as..."),
+                                    )
+                                    .clicked()
+                                {
+                                    self.save_project(ctx, true);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Exit").clicked() {
+                                    self.request(Pending::Close, ctx);
+                                    ui.close();
+                                }
+                            });
+                            ui.menu_button("Edit", |ui| {
+                                if ui
+                                    .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
+                                    .clicked()
+                                {
+                                    self.undo_redo(false);
+                                    history_action = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+                                    .clicked()
+                                {
+                                    self.undo_redo(true);
+                                    history_action = true;
+                                    ui.close();
+                                }
+                                match self.page {
+                                    Page::Smoothing => {
+                                        ui.separator();
+                                        if ui.button("Open GPX/FIT...").clicked() {
+                                            self.request(Pending::Open(None), ctx);
+                                            ui.close();
+                                        }
+                                    }
+                                    Page::Syncing => {
+                                        ui.separator();
+                                        if ui.button("Open GPX/FIT...").clicked() {
+                                            self.request(Pending::Open(None), ctx);
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.studio.picking_landmark(),
+                                                egui::Button::new("Open prepared video..."),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.studio.open_video(ctx, None);
+                                            ui.close();
+                                        }
+                                    }
+                                    Page::Delivery => {}
+                                }
+                            });
+                        });
+                        if self.track.is_some() {
+                            let name = self
+                                .project_path
+                                .as_ref()
+                                .and_then(|path| path.file_name())
+                                .map_or_else(
+                                    || "Not saved yet".into(),
+                                    |name| name.to_string_lossy(),
+                                );
+                            let unsaved = if self.project_dirty || self.dirty || self.studio.dirty {
+                                " (unsaved changes)"
+                            } else {
+                                ""
+                            };
+                            let label = format!("Project: {name}{unsaved}");
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&label).small()).truncate(),
                             )
-                            .clicked()
-                        {
-                            self.save_project(ctx, true);
-                        }
-                        if ui
-                            .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
-                            .clicked()
-                        {
-                            self.undo_redo(false);
-                            history_action = true;
-                        }
-                        if ui
-                            .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
-                            .clicked()
-                        {
-                            self.undo_redo(true);
-                            history_action = true;
-                        }
-                        ui.selectable_value(&mut self.studio_open, false, "GPX smoothing");
-                        ui.selectable_value(&mut self.studio_open, true, "Video & Incyclist");
-                    });
-                    if self.track.is_some() {
-                        let name = self
-                            .project_path
-                            .as_ref()
-                            .and_then(|path| path.file_name())
-                            .map_or_else(|| "Not saved yet".into(), |name| name.to_string_lossy());
-                        let unsaved = if self.project_dirty || self.dirty || self.studio.dirty {
-                            " (unsaved changes)"
-                        } else {
-                            ""
-                        };
-                        let label = format!("Project: {name}{unsaved}");
-                        ui.add(egui::Label::new(egui::RichText::new(&label).small()).truncate())
                             .on_hover_text(label);
-                    }
-                },
-            );
-        });
+                        }
+                        page_tabs(ui, &mut self.page);
+                    },
+                );
+            });
         egui::Panel::bottom("status").show(root, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if self.worker.is_some() || self.studio.busy() {
@@ -1421,21 +1538,64 @@ impl eframe::App for RlvForge {
                 ui.colored_label(Color32::from_rgb(180, 35, 35), error);
             }
         });
+        if self.page != Page::Delivery {
+            egui::Panel::right(("edit-sidebar", self.page))
+                .default_size((root.available_width() * 0.32).clamp(240.0, 460.0))
+                .min_size(220.0)
+                .max_size((root.available_width() * 0.45).max(220.0))
+                .resizable(true)
+                .show(root, |ui| {
+                    egui::ScrollArea::both()
+                        .id_salt("sidebar-scroll")
+                        .show(ui, |ui| {
+                            ui.add_enabled_ui(
+                                self.worker.is_none()
+                                    && !self.studio.busy()
+                                    && self.confirm.is_none(),
+                                |ui| {
+                                    let edit = if self.page == Page::Smoothing {
+                                        self.studio
+                                            .show_cuts(ui)
+                                            .map(crate::studio::Edit::ReplaceCuts)
+                                    } else {
+                                        self.studio.sync_sidebar(ui)
+                                    };
+                                    self.apply_studio_edit(edit, ctx);
+                                },
+                            );
+                        });
+                });
+        }
         egui::CentralPanel::default().show(root, |ui| {
             egui::ScrollArea::vertical()
-                .id_salt("page")
-                .scroll_bar_visibility(if self.studio_open {
+                .id_salt(("page", self.page))
+                .scroll_bar_visibility(if self.page == Page::Syncing {
                     egui::scroll_area::ScrollBarVisibility::AlwaysVisible
                 } else {
                     egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
                 })
                 .show(ui, |ui| {
                     ui.add_enabled_ui(self.worker.is_none() && self.confirm.is_none(), |ui| {
-                        if self.studio_open {
-                            ui.add_enabled_ui(!self.studio.busy(), |ui| {
-                                self.import_controls(ui, ctx)
-                            });
-                            let cut = self.studio.show(
+                        match self.page {
+                            Page::Syncing => {
+                                let edit = self.studio.show(
+                                    ui,
+                                    crate::studio::Tracks {
+                                        current: self.track.as_ref(),
+                                        source: self.cut_source.as_ref(),
+                                    },
+                                    &mut self.map,
+                                );
+                                self.apply_studio_edit(edit, ctx);
+                            }
+                            Page::Smoothing => {
+                                self.source_summary(ui);
+                                self.charts(ui);
+                                ui.add_enabled_ui(self.track.is_some(), |ui| {
+                                    self.reset_control(ui, ctx)
+                                });
+                            }
+                            Page::Delivery => self.studio.show_delivery(
                                 ui,
                                 crate::studio::Tracks {
                                     current: self.track.as_ref(),
@@ -1443,27 +1603,7 @@ impl eframe::App for RlvForge {
                                 },
                                 &self.name,
                                 &self.description,
-                                &mut self.map,
-                            );
-                            if let Some(edit) = cut {
-                                match edit {
-                                    crate::studio::Edit::Cut(cut) => self.cut_time(cut, ctx),
-                                    crate::studio::Edit::ReplaceCuts(cuts) => {
-                                        self.replace_cuts(cuts, ctx)
-                                    }
-                                    crate::studio::Edit::Sync(points) => {
-                                        self.apply_sync(points, ctx)
-                                    }
-                                }
-                            }
-                        } else {
-                            self.top_section(ui, ctx);
-                            ui.add_space(10.0);
-                            self.charts(ui);
-                            ui.add_space(10.0);
-                            ui.add_enabled_ui(self.track.is_some(), |ui| {
-                                self.export_controls(ui, ctx)
-                            });
+                            ),
                         }
                     });
                 });
@@ -1474,7 +1614,7 @@ impl eframe::App for RlvForge {
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label("Save a project to resume later with GPX edits, cuts, sync points and video alignment. GPX/bundle export alone does not save an editable project. Reset affects elevations only and can be undone.");
+                    ui.label("Save a project to resume later with GPX edits, cuts, sync points and video alignment. GPX/bundle export alone does not save an editable project. Reset re-reads the original GPX/FIT and clears cuts and sync points; it can be undone.");
                     ui.add_enabled_ui(self.worker.is_none() && !self.studio.busy(), |ui| { ui.horizontal(|ui| {
                         if ui.add_enabled(self.track.is_some(), egui::Button::new("Save project and continue")).clicked() {
                             self.save_project(ctx, false);
@@ -1500,12 +1640,24 @@ impl eframe::App for RlvForge {
             || previous_hover != self.hover_distance
             || before.track != self.track
         {
-            // The map is drawn above the charts, so redraw it with the updated range/cursor.
+            // Refresh the charts after range or cursor changes.
             ctx.request_repaint();
         }
-        let project_changed =
-            self.edit_state() != before || self.studio.position() != previous_video_position;
-        if !history_action {
+        let after = self.edit_state();
+        let project_changed = after != before || self.studio.position() != previous_video_position;
+        if self.track.is_some()
+            && !project_clean
+            && (self.auto_export_due.is_none() || !was_busy)
+            && (before.track != after.track
+                || before.cut_source != after.cut_source
+                || before.name != after.name
+                || before.description != after.description
+                || self.studio.export_changed(&before.studio))
+        {
+            self.auto_export_due =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
+        }
+        if !(history_action || before.track.is_some() && self.track.is_none()) {
             let after = self.edit_state();
             let focused = ctx.memory(|memory| memory.focused());
             let group = if before.track != after.track || was_busy {
@@ -1524,7 +1676,52 @@ impl eframe::App for RlvForge {
         {
             self.project_dirty = true;
         }
+        if let Some(due) = self.auto_export_due {
+            if self.track.is_none() {
+                self.auto_export_due = None;
+            } else if std::time::Instant::now() >= due
+                && self.worker.is_none()
+                && !self.studio.busy()
+                && self.confirm.is_none()
+                && !ctx.input(|input| input.pointer.any_down())
+            {
+                self.auto_export_due = None;
+                self.export(ctx);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
     }
+}
+
+impl eframe::App for RlvForge {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(root);
+    }
+}
+
+fn automatic_gpx_path(source: &Path) -> Result<PathBuf, String> {
+    let mut filename = source
+        .file_stem()
+        .ok_or("The source track has no filename.")?
+        .to_os_string();
+    filename.push("-smoothed.gpx");
+    Ok(source.with_file_name(filename))
+}
+
+fn save_automatic_gpx(
+    path: &Path,
+    source: &Path,
+    xml: &str,
+    video: Option<&Path>,
+) -> Result<(), String> {
+    if path
+        .canonicalize()
+        .is_ok_and(|target| source.canonicalize().is_ok_and(|source| source == target))
+    {
+        return Err("Automatic GPX export cannot overwrite the source track. Remove the conflicting destination link.".into());
+    }
+    save_gpx(path, xml, video)
 }
 
 fn save_gpx(path: &Path, xml: &str, video: Option<&Path>) -> Result<(), String> {
@@ -1787,6 +1984,19 @@ fn paint_chart(
 mod tests {
     use super::*;
 
+    fn finish_job(app: &mut RlvForge, ctx: &egui::Context) {
+        let result = app
+            .worker
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender.send(result).unwrap();
+        app.worker = Some(receiver);
+        app.poll(ctx);
+    }
+
     #[test]
     fn profile_clicks_scrub_and_drags_pan_without_accumulating_idle_motion() {
         let track = Arc::new(Track::parse("<gpx><rte><rtept lat=\"0\" lon=\"0\"><ele>100</ele></rtept><rtept lat=\"0\" lon=\"0.01\"><ele>150</ele></rtept></rte></gpx>".into()).unwrap());
@@ -2025,7 +2235,7 @@ mod tests {
         first.name = "Saved ride".into();
         first.description = "My edits".into();
         first.trainer_mode = true;
-        first.studio_open = true;
+        first.page = Page::Delivery;
         let path = directory.path().join("work.gpxproj");
         first.project_document().unwrap().save(&path, None).unwrap();
         let mut restarted = RlvForge::empty(None);
@@ -2041,7 +2251,7 @@ mod tests {
         assert_eq!(restarted.track, first.track);
         assert_eq!(restarted.cut_source, first.cut_source);
         assert_eq!(restarted.project_path, Some(path.clone()));
-        assert!(restarted.trainer_mode && restarted.studio_open);
+        assert!(restarted.trainer_mode && restarted.page == Page::Delivery);
         assert!(!restarted.dirty && !restarted.project_dirty && !restarted.studio.dirty);
         let before = restarted.edit_state();
         deliver(&mut restarted, Err("Invalid project".into()));
@@ -2069,6 +2279,23 @@ mod tests {
             crate::project::Project::load(&path).unwrap().document.name,
             "Another edit"
         );
+        let mut legacy = serde_json::to_value(first.project_document().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("page");
+        legacy["studio_open"] = serde_json::Value::Bool(true);
+        legacy["studio"]["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("zip_archive");
+        let legacy_path = directory.path().join("legacy.gpxproj");
+        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        deliver(
+            &mut restarted,
+            Ok(Job::ProjectLoaded {
+                project: Box::new(crate::project::Project::load(&legacy_path).unwrap()),
+                path: legacy_path,
+            }),
+        );
+        assert_eq!(restarted.page, Page::Syncing);
     }
 
     #[test]
@@ -2085,6 +2312,395 @@ mod tests {
     }
 
     #[test]
+    fn applying_sync_points_and_cut_edits_preserves_the_map_zoom() {
+        use crate::studio::Studio;
+        use rlv_forge::sync::{Kind, SyncPoint};
+
+        let points: String = (0..=50).map(|i| format!(
+            "<trkpt lat=\"0\" lon=\"{}\"><ele>{}</ele><time>2026-01-01T00:00:{i:02}Z</time></trkpt>",
+            i as f64 * 0.0001, if i < 2 { 9999 } else { 100 },
+        )).collect();
+        let source = Arc::new(
+            Track::parse(format!("<gpx><trk><trkseg>{points}</trkseg></trk></gpx>")).unwrap(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("original.gpx");
+        let original_xml = source.source_xml().to_owned();
+        std::fs::write(&source_path, &original_xml).unwrap();
+        let video = directory.path().join("prepared.mp4");
+        std::fs::write(&video, b"video reference; no decoding in this test").unwrap();
+        let mut studio = Studio::default();
+        studio.set_track(&source);
+        let mut state = serde_json::to_value(studio.project_state().unwrap()).unwrap();
+        state["settings"]["path"] = serde_json::json!(video);
+        state["settings"]["info"] = serde_json::json!({
+            "duration": 40.04, "fps": 25.0, "width": 640, "height": 360,
+            "frames": 1001, "has_audio": false
+        });
+        let selection = [0.0, source.total_distance()];
+        let view = serde_json::from_value(serde_json::json!({
+            "center": [0.001, 0.0], "zoom": 15.0, "online": false
+        }))
+        .unwrap();
+        let mut app = RlvForge::empty(None);
+        app.studio =
+            Studio::from_project(serde_json::from_value(state).unwrap(), &source, &source).unwrap();
+        app.map = crate::map::TrackMap::from_project(&view, source.clone(), selection).unwrap();
+        app.track = Some(source.clone());
+        app.cut_source = Some(source);
+        app.source_path = Some(source_path.clone());
+        app.selection = selection;
+        app.page = Page::Syncing;
+        let ctx = egui::Context::default();
+        let draw = |app: &mut RlvForge| {
+            crate::test_ui(&ctx, Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.map.show_at_position(
+                        ui,
+                        app.track.as_deref(),
+                        app.selection,
+                        Some([0.001, 0.0]),
+                        crate::map::SyncOverlay::default(),
+                    );
+                });
+            });
+        };
+        draw(&mut app);
+        let landmark = SyncPoint {
+            video: 0.0,
+            gpx: 0.0,
+            kind: Kind::Normal,
+        };
+        for points in [
+            vec![landmark],
+            vec![
+                landmark,
+                SyncPoint {
+                    video: 10.0,
+                    gpx: 10.0,
+                    kind: Kind::BeforeCut,
+                },
+                SyncPoint {
+                    video: 10.04,
+                    gpx: 20.0,
+                    kind: Kind::AfterCut,
+                },
+            ],
+            vec![
+                SyncPoint {
+                    video: 0.0,
+                    gpx: 2.0,
+                    kind: Kind::VideoStart,
+                },
+                SyncPoint {
+                    video: 10.0,
+                    gpx: 10.0,
+                    kind: Kind::BeforeCut,
+                },
+                SyncPoint {
+                    video: 10.04,
+                    gpx: 20.0,
+                    kind: Kind::AfterCut,
+                },
+            ],
+            vec![
+                SyncPoint {
+                    video: 0.0,
+                    gpx: 2.0,
+                    kind: Kind::VideoStart,
+                },
+                SyncPoint {
+                    video: 10.0,
+                    gpx: 10.0,
+                    kind: Kind::BeforeCut,
+                },
+                SyncPoint {
+                    video: 10.04,
+                    gpx: 20.0,
+                    kind: Kind::AfterCut,
+                },
+                SyncPoint {
+                    video: 40.0,
+                    gpx: 45.0,
+                    kind: Kind::VideoEnd,
+                },
+            ],
+        ] {
+            app.apply_sync(points, &ctx);
+            finish_job(&mut app, &ctx);
+            assert!(app.error.is_none(), "{:?}", app.error);
+            draw(&mut app);
+            let view = serde_json::to_value(app.map.project_view()).unwrap();
+            assert_eq!(view["zoom"], 15.0);
+        }
+        assert!(app.selection[1] < selection[1]);
+        assert!(app
+            .track
+            .as_ref()
+            .unwrap()
+            .points
+            .iter()
+            .all(|point| point.elevation == 100.0));
+        app.auto_smooth(&ctx);
+        finish_job(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(app
+            .track
+            .as_ref()
+            .unwrap()
+            .points
+            .iter()
+            .all(|point| point.elevation == 100.0));
+        app.export(&ctx);
+        finish_job(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let exported = Track::read(&directory.path().join("original-smoothed.gpx")).unwrap();
+        assert!((exported.points[0].longitude - 0.0002).abs() < 1e-9);
+        assert_eq!(std::fs::read_to_string(source_path).unwrap(), original_xml);
+        app.replace_cuts(
+            vec![CutRange::Time(Clip {
+                start: 30.0,
+                end: 35.0,
+            })],
+            &ctx,
+        );
+        finish_job(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        draw(&mut app);
+        let view = serde_json::to_value(app.map.project_view()).unwrap();
+        assert_eq!(view["zoom"], 15.0);
+        app.map.reset_view();
+        draw(&mut app);
+        let view = serde_json::to_value(app.map.project_view()).unwrap();
+        assert_ne!(view["zoom"], 15.0);
+    }
+
+    #[test]
+    fn automatic_exports_follow_import_smoothing_cuts_and_history_but_not_view_changes() {
+        fn finish(app: &mut RlvForge, ctx: &egui::Context) {
+            finish_job(app, ctx);
+            assert!(app.error.is_none(), "{:?}", app.error);
+        }
+        fn draw(app: &mut RlvForge, ctx: &egui::Context) {
+            crate::test_ui(
+                ctx,
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1180.0, 1600.0))),
+                    ..Default::default()
+                },
+                |root| app.show(root),
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("ride.gpx");
+        let destination = directory.path().join("ride-smoothed.gpx");
+        let points: String = (0..=30).map(|i| format!(
+            "<trkpt lat=\"0\" lon=\"{}\"><ele>{}</ele><time>2026-01-01T00:00:{i:02}Z</time></trkpt>",
+            i as f64 * 0.0001, if i == 15 { 300 } else { 100 + i },
+        )).collect();
+        let original = format!("<gpx><trk><trkseg>{points}</trkseg></trk></gpx>");
+        std::fs::write(&source, &original).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = RlvForge::empty(None);
+        app.map = crate::map::TrackMap::offline();
+        app.open(Some(source.clone()), &ctx);
+        finish(&mut app, &ctx);
+        draw(&mut app, &ctx);
+        finish(&mut app, &ctx);
+        let imported = std::fs::read(&destination).unwrap();
+        assert!(app.project_dirty);
+
+        let before = app.edit_state();
+        app.auto_smooth(&ctx);
+        finish(&mut app, &ctx);
+        app.history.record(before, &app.edit_state(), None);
+        draw(&mut app, &ctx);
+        finish(&mut app, &ctx);
+        let smoothed = std::fs::read(&destination).unwrap();
+        assert_ne!(smoothed, imported);
+
+        let before = app.edit_state();
+        let cut = Clip {
+            start: 5.0,
+            end: 10.0,
+        };
+        app.apply_cut(
+            timeline::cut(app.track.as_ref().unwrap(), cut),
+            Some(cut.start),
+        );
+        assert!(app.error.is_none());
+        app.history.record(before, &app.edit_state(), None);
+        draw(&mut app, &ctx);
+        finish(&mut app, &ctx);
+        let shortened = std::fs::read(&destination).unwrap();
+        assert_ne!(shortened, smoothed);
+        for (redo, expected) in [(false, &smoothed), (true, &shortened)] {
+            app.undo_redo(redo);
+            draw(&mut app, &ctx);
+            finish(&mut app, &ctx);
+            assert_eq!(&std::fs::read(&destination).unwrap(), expected);
+        }
+        let before = app.edit_state();
+        app.chart = Chart::Slope;
+        app.show_original = false;
+        app.page = Page::Delivery;
+        app.history.record(before, &app.edit_state(), None);
+        draw(&mut app, &ctx);
+        assert!(app.worker.is_none() && app.auto_export_due.is_none());
+        app.undo_redo(false);
+        draw(&mut app, &ctx);
+        assert!(app.worker.is_none() && app.auto_export_due.is_none());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+
+        app.request(Pending::New, &ctx);
+        assert!(app.confirm.is_some() && app.track.is_some());
+        let pending = app.confirm.take().unwrap();
+        app.perform(pending, &ctx);
+        draw(&mut app, &ctx);
+        assert!(app.track.is_none() && app.worker.is_none() && !app.history.can_undo());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_export_rejects_source_aliases_and_reports_unwritable_destinations() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("ride.fit");
+        std::fs::write(&source, b"source data").unwrap();
+        let destination = automatic_gpx_path(&source).unwrap();
+        std::os::unix::fs::symlink(&source, &destination).unwrap();
+        assert!(save_automatic_gpx(&destination, &source, "<gpx/>", None)
+            .unwrap_err()
+            .contains("source track"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"source data");
+        let missing = directory.path().join("missing/ride-smoothed.gpx");
+        assert!(save_automatic_gpx(&missing, &source, "<gpx/>", None)
+            .unwrap_err()
+            .contains("Cannot stage GPX"));
+    }
+
+    #[test]
+    fn tabs_remain_accessible_without_inputs_and_import_menus_follow_the_page() {
+        fn label(output: &egui::FullOutput, value: &str) -> Option<Pos2> {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.job.text == value => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+        }
+        fn draw(
+            app: &mut RlvForge,
+            ctx: &egui::Context,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            crate::test_ui(
+                ctx,
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1180.0, 1600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |root| app.show(root),
+            )
+        }
+        fn click(app: &mut RlvForge, ctx: &egui::Context, position: Pos2) -> egui::FullOutput {
+            for pressed in [true, false] {
+                let output = draw(
+                    app,
+                    ctx,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                if !pressed {
+                    return output;
+                }
+            }
+            unreachable!()
+        }
+        let ctx = egui::Context::default();
+        let mut app = RlvForge::empty(None);
+        let output = draw(&mut app, &ctx, vec![]);
+        assert_eq!(app.page, Page::Syncing);
+        assert!(label(&output, "Syncing").unwrap().x < label(&output, "Smoothing").unwrap().x);
+        let smoothing = label(&output, "Smoothing").unwrap();
+        let output = click(&mut app, &ctx, smoothing);
+        assert!(label(&output, "Reset The Data").is_some());
+        assert!(label(&output, "GPX cuts").is_some());
+        assert!(label(&output, "Track map").is_none());
+        assert!(label(&output, "Online tiles").is_none());
+        assert!(label(&output, "Fit track").is_none());
+        for removed in [
+            "GPX is exported automatically beside the source after data edits.",
+            "File name:",
+            "GPX name:",
+            "Description:",
+            "Resulting GPX (optional text preview)",
+            "Generate GPX preview",
+        ] {
+            assert!(label(&output, removed).is_none());
+        }
+        let edit = label(&output, "Edit").unwrap();
+        click(&mut app, &ctx, edit);
+        let output = draw(&mut app, &ctx, vec![]);
+        assert!(label(&output, "Open GPX/FIT...").is_some());
+        assert!(label(&output, "Open prepared video...").is_none());
+        click(&mut app, &ctx, edit);
+        let output = draw(&mut app, &ctx, vec![]);
+        let syncing = label(&output, "Syncing").unwrap();
+        let output = click(&mut app, &ctx, syncing);
+        assert_eq!(app.page, Page::Syncing);
+        assert!(output.platform_output.events.iter().any(|event| {
+            let info = event.widget_info();
+            info.role == egui::Role::Tab
+                && info.selected == Some(true)
+                && info.label.as_deref() == Some("Syncing")
+        }));
+        assert!(label(&output, "Export Incyclist bundle...").is_none());
+        assert!(label(&output, "Sync points").is_some());
+        assert!(label(&output, "GPX cuts").is_none());
+        click(&mut app, &ctx, edit);
+        let output = draw(&mut app, &ctx, vec![]);
+        assert!(label(&output, "Open prepared video...").is_some());
+        assert!(label(&output, "Open GPX/FIT...").is_some());
+        click(&mut app, &ctx, edit);
+        let output = draw(&mut app, &ctx, vec![]);
+        let delivery = label(&output, "Delivery").unwrap();
+        let output = click(&mut app, &ctx, delivery);
+        assert_eq!(app.page, Page::Delivery);
+        assert!(label(&output, "Export Incyclist bundle...").is_some());
+        assert!(label(&output, "Sync points").is_none());
+        assert!(app.track.is_none() && app.worker.is_none());
+        for (key, expected) in [
+            (egui::Key::ArrowLeft, Page::Smoothing),
+            (egui::Key::Home, Page::Syncing),
+            (egui::Key::End, Page::Delivery),
+            (egui::Key::ArrowRight, Page::Syncing),
+            (egui::Key::Space, Page::Syncing),
+            (egui::Key::Enter, Page::Syncing),
+        ] {
+            draw(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(app.page, expected, "{key:?}");
+        }
+    }
+
+    #[test]
     fn undo_redo_restores_cut_smoothing_reset_and_file_replacement() {
         let points: String = (0..=10).map(|i| format!(
             "<trkpt lat=\"0\" lon=\"{}\"><ele>{}</ele><time>2026-01-01T00:00:{i:02}Z</time></trkpt>",
@@ -2092,8 +2708,15 @@ mod tests {
         )).collect();
         let track =
             Track::parse(format!("<gpx><trk><trkseg>{points}</trkseg></trk></gpx>")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("original.gpx");
+        std::fs::write(&source, track.source_xml()).unwrap();
+        let project_path = directory.path().join("ride.gpxproj");
+        let ctx = egui::Context::default();
         let mut app = RlvForge::empty(None);
         let empty = app.edit_state();
+        app.source_path = Some(source.clone());
+        app.project_path = Some(project_path.clone());
         app.studio.set_track(&track);
         app.selection = [0.0, track.total_distance()];
         app.track = Some(Arc::new(track));
@@ -2115,7 +2738,31 @@ mod tests {
         app.history
             .record(smoothed.clone(), &app.edit_state(), None);
         let cut_state = app.edit_state();
-        app.perform(Pending::Reset, &egui::Context::default());
+        let replacement = "<gpx><trk><name>Updated source</name><desc>Fresh metadata</desc><trkseg><trkpt lat=\"1\" lon=\"2\"><ele>200</ele><time>2026-01-01T01:00:00Z</time></trkpt><trkpt lat=\"1.1\" lon=\"2.1\"><ele>220</ele><time>2026-01-01T01:00:30Z</time></trkpt></trkseg></trk></gpx>";
+        std::fs::write(&source, replacement).unwrap();
+        let expected = Track::read(&source).unwrap();
+        app.perform(Pending::Reset, &ctx);
+        assert!(app.edit_state() == cut_state);
+        finish_job(&mut app, &ctx);
+        assert!(app.error.is_none());
+        assert_eq!(app.track.as_deref(), Some(&expected));
+        assert_eq!(app.cut_source.as_deref(), Some(&expected));
+        assert_eq!(app.name, expected.name);
+        assert_eq!(app.description, expected.description);
+        assert_eq!(app.project_path, Some(project_path));
+        assert!(app.studio.cuts().is_empty() && app.studio.sync_points().is_empty());
+        assert_eq!(app.selection, [0.0, expected.total_distance()]);
+        assert!(app.auto_export_due.is_some() && app.project_dirty);
+        app.export(&ctx);
+        finish_job(&mut app, &ctx);
+        assert!(app.error.is_none());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("original-smoothed.gpx")).unwrap(),
+            expected
+                .export(&expected.name, &expected.description)
+                .unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), replacement);
         app.history
             .record(cut_state.clone(), &app.edit_state(), None);
         let reset = app.edit_state();
@@ -2137,6 +2784,49 @@ mod tests {
     }
 
     #[test]
+    fn reset_reimports_fit_and_failed_reloads_preserve_the_working_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original.fit");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("data/2026-10-24.fit"),
+            &path,
+        )
+        .unwrap();
+        let original = Track::read(&path).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = RlvForge::empty(None);
+        app.install_source_track(original.clone(), path.clone());
+        Arc::make_mut(app.track.as_mut().unwrap()).points[1].elevation += 100.0;
+        app.request(Pending::Reset, &ctx);
+        assert!(matches!(app.confirm, Some(Pending::Reset)));
+        let pending = app.confirm.take().unwrap();
+        app.perform(pending, &ctx);
+        finish_job(&mut app, &ctx);
+        assert!(app.error.is_none());
+        assert_eq!(app.track.as_deref(), Some(&original));
+
+        Arc::make_mut(app.track.as_mut().unwrap()).points[1].elevation += 50.0;
+        let before = app.edit_state();
+        std::fs::write(&path, b"invalid FIT").unwrap();
+        app.perform(Pending::Reset, &ctx);
+        finish_job(&mut app, &ctx);
+        assert!(app.error.is_some() && app.edit_state() == before);
+        assert!(app.auto_export_due.is_none());
+        std::fs::remove_file(&path).unwrap();
+        app.perform(Pending::Reset, &ctx);
+        finish_job(&mut app, &ctx);
+        assert!(app.error.as_ref().unwrap().contains("Cannot read"));
+        assert!(app.edit_state() == before);
+
+        app.source_path = None;
+        let before = app.edit_state();
+        app.perform(Pending::Reset, &ctx);
+        assert!(app.worker.is_none());
+        assert!(app.error.as_ref().unwrap().contains("source path"));
+        assert!(app.edit_state() == before);
+    }
+
+    #[test]
     fn metadata_and_view_options_share_history_without_marking_view_changes_dirty() {
         let mut app = RlvForge::empty(None);
         let before = app.edit_state();
@@ -2147,7 +2837,7 @@ mod tests {
         app.chart = Chart::Slope;
         app.show_original = false;
         app.trainer_mode = true;
-        app.studio_open = true;
+        app.page = Page::Syncing;
         app.history.record(before.clone(), &app.edit_state(), None);
         let after = app.edit_state();
         app.undo_redo(false);

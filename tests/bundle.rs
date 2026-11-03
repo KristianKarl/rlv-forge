@@ -5,7 +5,12 @@ use rlv_forge::{
     timeline::{self, Clip},
     video,
 };
-use std::{process::Command, sync::atomic::AtomicBool};
+use std::{
+    cell::RefCell,
+    io::Read,
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 #[test]
 fn exports_a_complete_bundle_with_a_byte_identical_prepared_video() {
@@ -71,6 +76,7 @@ fn exports_a_complete_bundle_with_a_byte_identical_prepared_video() {
         sync: None,
     };
     let output = bundle::export(options(), &destination, &cancel).unwrap();
+    assert!(output.archive.is_none());
     assert_eq!(output.frames, 36);
     assert_eq!(output.duration, 3.0);
     assert_eq!(std::fs::read(&source).unwrap(), original);
@@ -164,4 +170,66 @@ fn exports_a_complete_bundle_with_a_byte_identical_prepared_video() {
     );
     let synchronized_xml = std::fs::read_to_string(synchronized.join("ride.xml")).unwrap();
     assert!(synchronized_xml.contains("<cut time=\"0:00:01.033\"/>"));
+
+    let zipped = directory.path().join("zipped.bundle");
+    let progress = RefCell::new(Vec::new());
+    let output = bundle::export_with_progress(options(), &zipped, &cancel, true, |value| {
+        progress.borrow_mut().push(value);
+    })
+    .unwrap();
+    assert_eq!(
+        output.archive.as_deref(),
+        Some(directory.path().join("zipped.bundle.zip").as_path())
+    );
+    let values = progress.into_inner();
+    assert_eq!(values.first(), Some(&0.0));
+    assert_eq!(values.last(), Some(&1.0));
+    assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+    let mut archive =
+        zip::ZipArchive::new(std::fs::File::open(output.archive.unwrap()).unwrap()).unwrap();
+    assert_eq!(archive.len(), 3);
+    for filename in ["ride.mp4", "ride.gpx", "ride.xml"] {
+        let mut bytes = Vec::new();
+        archive
+            .by_name(filename)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, std::fs::read(zipped.join(filename)).unwrap());
+    }
+
+    let cancelled_zip = directory.path().join("cancelled-zip");
+    let cancel_zip = AtomicBool::new(false);
+    assert!(
+        bundle::export_with_progress(options(), &cancelled_zip, &cancel_zip, true, |value| {
+            if value >= 0.6 {
+                cancel_zip.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap_err()
+        .contains("cancelled")
+    );
+    assert!(!cancelled_zip.exists());
+    assert!(!directory.path().join("cancelled-zip.zip").exists());
+
+    let collision = directory.path().join("collision");
+    let existing_zip = directory.path().join("collision.zip");
+    std::fs::write(&existing_zip, b"existing archive").unwrap();
+    assert!(bundle::export_with_progress(options(), &collision, &cancel, true, |_| {}).is_err());
+    assert!(!collision.exists());
+    assert_eq!(std::fs::read(&existing_zip).unwrap(), b"existing archive");
+
+    let raced = directory.path().join("raced");
+    let raced_zip = directory.path().join("raced.zip");
+    assert!(
+        bundle::export_with_progress(options(), &raced, &cancel, true, |value| {
+            if value == 0.98 {
+                std::fs::write(&raced_zip, b"concurrent archive").unwrap();
+            }
+        })
+        .is_err()
+    );
+    assert!(!raced.exists());
+    assert_eq!(std::fs::read(&raced_zip).unwrap(), b"concurrent archive");
+    assert_eq!(std::fs::read(&source).unwrap(), original);
 }

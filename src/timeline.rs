@@ -462,6 +462,17 @@ pub(crate) fn edit_gpx_samples(
     )
 }
 
+pub(crate) fn append_last_point(xml: &str) -> Result<String, String> {
+    let doc = Document::parse(xml).map_err(|error| error.to_string())?;
+    let nodes = track_nodes(&doc)?;
+    let last = nodes
+        .last()
+        .ok_or("The synchronized GPX has no final sample.")?;
+    let mut output = xml.to_owned();
+    output.insert_str(last.range().end, &xml[last.range()]);
+    Ok(output)
+}
+
 pub fn retime_gpx(xml: &str, seconds: &[f64]) -> Result<String, String> {
     let doc = Document::parse(xml).map_err(|error| error.to_string())?;
     let nodes = track_nodes(&doc)?;
