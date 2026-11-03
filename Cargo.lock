@@ -3311,7 +3311,7 @@ dependencies = [
 
 [[package]]
 name = "rlv-forge"
-version = "0.1.2"
+version = "1.0.3"
 dependencies = [
  "clap",
  "directories",
