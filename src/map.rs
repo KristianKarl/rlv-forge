@@ -1,5 +1,8 @@
 use eframe::egui::{self, vec2, Color32, Shape, Stroke, Vec2};
-use rlv_forge::gpx::{Point, Track};
+use rlv_forge::{
+    gpx::{Point, Track},
+    timeline::{Clip, Timing},
+};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -41,9 +44,11 @@ pub struct SyncOverlay {
     pub markers: Vec<SyncMarker>,
     pub picking: bool,
     pub hint: Option<usize>,
+    pub cut_preview: Option<(Arc<Timing>, Clip)>,
 }
 
 enum Cursor {
+    #[cfg(test)]
     Distance(f64),
     Position([f64; 2]),
 }
@@ -208,6 +213,11 @@ impl TrackMap {
         self.last_size = Vec2::ZERO;
     }
 
+    pub fn retain_view(&mut self, selection: [f64; 2]) {
+        self.last_selection = Some(selection);
+        self.auto_fit = false;
+    }
+
     pub fn set_reference_track(&mut self, track: Arc<Track>) {
         self.reference_track = Some(track);
         self.reset_view();
@@ -237,7 +247,8 @@ impl TrackMap {
         Ok(())
     }
 
-    pub fn show(
+    #[cfg(test)]
+    fn show(
         &mut self,
         ui: &mut egui::Ui,
         track: Option<&Track>,
@@ -273,6 +284,7 @@ impl TrackMap {
         sync: SyncOverlay,
     ) -> Option<Vec<RoutePick>> {
         let (hover_distance, marker_position) = match cursor {
+            #[cfg(test)]
             Some(Cursor::Distance(distance)) => (Some(distance), None),
             Some(Cursor::Position([lon, lat])) => (None, Some(map_position(lon, lat))),
             None => (None, None),
@@ -283,22 +295,22 @@ impl TrackMap {
             self.fit_selection = true;
             self.reset_view();
         }
-        ui.horizontal(|ui| {
+        let controls_below = sync.viewport.is_some();
+        if controls_below {
+            let header_height = (ui.text_style_height(&egui::TextStyle::Button)
+                + 2.0 * ui.spacing().button_padding.y)
+                .max(ui.spacing().interact_size.y);
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), header_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.strong("Track map");
+                },
+            );
+        } else {
             ui.strong("Track map");
-            if ui
-                .add_enabled(track.is_some(), egui::Button::new("Fit track"))
-                .clicked()
-            {
-                self.reset_view();
-                self.fit_selection = false;
-                self.revision += 1;
-            }
-            if ui.checkbox(&mut self.online, "Online tiles").changed() {
-                self.tiles = None;
-                self.waiting_since = None;
-                self.error = None;
-            }
-        });
+            self.controls(ui, track.is_some());
+        }
         let size = sync
             .viewport
             .unwrap_or_else(|| vec2(ui.available_width(), 210.0));
@@ -313,6 +325,9 @@ impl TrackMap {
                 egui::FontId::proportional(15.0),
                 ROUTE,
             );
+            if controls_below {
+                self.controls(ui, false);
+            }
             attribution(ui);
             return None;
         };
@@ -382,8 +397,11 @@ impl TrackMap {
                 input.smooth_scroll_delta = Vec2::ZERO;
             });
         }
-        attribution(ui);
         let missing = observed.as_ref().map_or(0, |tiles| tiles.missing);
+        if controls_below {
+            self.controls(ui, true);
+        }
+        attribution(ui);
         ui.allocate_ui_with_layout(vec2(size.x, 72.0), egui::Layout::top_down(egui::Align::Min), |ui| {
             if let Some(error) = &self.error {
                 ui.add(egui::Label::new(egui::RichText::new(error).color(Color32::from_rgb(180, 35, 35))).truncate())
@@ -417,6 +435,24 @@ impl TrackMap {
         });
         let result = picked.borrow_mut().take();
         result
+    }
+
+    fn controls(&mut self, ui: &mut egui::Ui, has_track: bool) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(has_track, egui::Button::new("Fit track"))
+                .clicked()
+            {
+                self.reset_view();
+                self.fit_selection = false;
+                self.revision += 1;
+            }
+            if ui.checkbox(&mut self.online, "Online tiles").changed() {
+                self.tiles = None;
+                self.waiting_since = None;
+                self.error = None;
+            }
+        });
     }
 }
 
@@ -547,6 +583,39 @@ fn route_sections(track: &Track, selection: [f64; 2]) -> Vec<Vec<Position>> {
     sections
 }
 
+fn cut_preview_sections(track: &Track, timing: &Timing, cut: Clip) -> Vec<Vec<Position>> {
+    let mut sections = Vec::new();
+    let mut line = Vec::new();
+    for (points, seconds) in track.points.windows(2).zip(timing.seconds.windows(2)) {
+        let [a, b] = [&points[0], &points[1]];
+        if !connected(a, b) {
+            if !line.is_empty() {
+                sections.push(std::mem::take(&mut line));
+            }
+            continue;
+        }
+        let start = cut.start.max(seconds[0]);
+        let end = cut.end.min(seconds[1]);
+        if start >= end {
+            continue;
+        }
+        for time in [start, end] {
+            let fraction = (time - seconds[0]) / (seconds[1] - seconds[0]);
+            let position = map_position(
+                a.longitude + fraction * (b.longitude - a.longitude),
+                a.latitude + fraction * (b.latitude - a.latitude),
+            );
+            if line.last() != Some(&position) {
+                line.push(position);
+            }
+        }
+    }
+    if !line.is_empty() {
+        sections.push(line);
+    }
+    sections
+}
+
 struct RouteOverlay<'a> {
     track: &'a Track,
     reference_track: Option<&'a Track>,
@@ -668,6 +737,26 @@ impl Plugin for RouteOverlay<'_> {
                 draw_route(&painter, line, selected);
             }
         }
+        if let Some((timing, cut)) = self
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.overlay.cut_preview.as_ref())
+        {
+            for section in
+                cut_preview_sections(self.reference_track.unwrap_or(self.track), timing, *cut)
+            {
+                let mut line: Vec<_> = section
+                    .into_iter()
+                    .map(|position| projector.project(position).to_pos2())
+                    .collect();
+                line.dedup();
+                if line.len() == 1 {
+                    painter.circle_filled(line[0], 3.5, RED_MARKER);
+                } else if line.len() > 1 {
+                    painter.add(Shape::line(line, Stroke::new(7.0_f32, RED_MARKER)));
+                }
+            }
+        }
         let start = &self.track.points[0];
         let end = &self.track.points[self.track.points.len() - 1];
         let red_position = self.marker_position.unwrap_or_else(|| {
@@ -725,7 +814,10 @@ fn draw_route(painter: &egui::Painter, mut line: Vec<egui::Pos2>, selected: bool
     if line.len() == 1 {
         painter.circle_filled(line[0], 2.0, color);
     } else if line.len() > 1 {
-        painter.add(Shape::line(line, Stroke::new(2.5_f32, color)));
+        painter.add(Shape::line(
+            line,
+            Stroke::new(if selected { 4.5_f32 } else { 2.5_f32 }, color),
+        ));
     }
 }
 
@@ -1130,7 +1222,12 @@ mod tests {
                 .shapes
                 .iter()
                 .filter_map(|shape| match &shape.shape {
-                    Shape::Path(path) if path.stroke.width == 2.5 => Some(path),
+                    Shape::Path(path)
+                        if path.stroke.color == egui::epaint::ColorMode::Solid(SELECTED)
+                            || path.stroke.color == egui::epaint::ColorMode::Solid(ROUTE) =>
+                    {
+                        Some(path)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1158,6 +1255,108 @@ mod tests {
                 .unwrap();
             assert!(marker.distance(expected_marker) < 0.001);
         }
+    }
+
+    #[test]
+    fn pending_cut_is_a_thick_red_original_route_with_exact_boundaries() {
+        let (original, cut) = cut_reference_fixture();
+        let timing = Arc::new(timeline::timing(&original).unwrap());
+        let ctx = egui::Context::default();
+        for preview in [true, false] {
+            let mut expected = Vec::new();
+            let output = crate::test_ui(&ctx, Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (rect, response) =
+                        ui.allocate_exact_size(vec2(400.0, 210.0), egui::Sense::hover());
+                    let (center, zoom) =
+                        fitted_view(&original, rect.size(), [0.0, original.total_distance()]);
+                    let mut memory = MapMemory::default();
+                    memory.center_at(center);
+                    memory.set_zoom(zoom).unwrap();
+                    let projector = Projector::new(rect, &memory, center);
+                    expected = [(0.5, 0.0), (1.0, 0.0), (1.0, 50.0), (2.0, 0.0), (2.5, 0.0)]
+                        .into_iter()
+                        .map(|(lon, lat)| projector.project(lon_lat(lon, lat)).to_pos2())
+                        .collect();
+                    Box::new(RouteOverlay {
+                        track: &cut,
+                        reference_track: Some(&original),
+                        selection: [0.0, cut.total_distance()],
+                        hover_distance: None,
+                        marker_position: None,
+                        sync: Some(SyncInteraction {
+                            overlay: SyncOverlay {
+                                cut_preview: preview.then(|| {
+                                    (
+                                        timing.clone(),
+                                        Clip {
+                                            start: 0.5,
+                                            end: 3.5,
+                                        },
+                                    )
+                                }),
+                                ..Default::default()
+                            },
+                            picked: Rc::new(RefCell::new(None)),
+                        }),
+                    })
+                    .run(ui, &response, &projector, &memory);
+                });
+            });
+            let red_paths: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    Shape::Path(path)
+                        if path.stroke.color == egui::epaint::ColorMode::Solid(RED_MARKER) =>
+                    {
+                        Some(path)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if preview {
+                assert_eq!(red_paths.len(), 1);
+                assert!(red_paths[0].stroke.width > 4.5);
+                assert_eq!(red_paths[0].points.len(), expected.len());
+                for (actual, expected) in red_paths[0].points.iter().zip(&expected) {
+                    assert!(actual.distance(*expected) < 0.001);
+                }
+            } else {
+                assert!(red_paths.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn pending_cut_does_not_bridge_disconnected_segments() {
+        let track = Track::parse(
+            "<gpx><trk><trkseg>\
+             <trkpt lat=\"0\" lon=\"0\"><ele>100</ele><time>2026-01-01T00:00:00Z</time></trkpt>\
+             <trkpt lat=\"0\" lon=\"1\"><ele>100</ele><time>2026-01-01T00:00:01Z</time></trkpt>\
+             </trkseg><trkseg>\
+             <trkpt lat=\"0\" lon=\"100\"><ele>100</ele><time>2026-01-01T00:00:03Z</time></trkpt>\
+             <trkpt lat=\"0\" lon=\"101\"><ele>100</ele><time>2026-01-01T00:00:04Z</time></trkpt>\
+             </trkseg></trk></gpx>"
+                .into(),
+        )
+        .unwrap();
+        let timing = timeline::timing(&track).unwrap();
+        let sections = cut_preview_sections(
+            &track,
+            &timing,
+            Clip {
+                start: 0.5,
+                end: 3.5,
+            },
+        );
+        assert_eq!(
+            sections,
+            vec![
+                vec![lon_lat(0.5, 0.0), lon_lat(1.0, 0.0)],
+                vec![lon_lat(100.0, 0.0), lon_lat(100.5, 0.0)],
+            ]
+        );
     }
 
     #[test]
@@ -1295,7 +1494,12 @@ mod tests {
             .shapes
             .iter()
             .filter_map(|shape| match &shape.shape {
-                Shape::Path(path) if path.stroke.width == 2.5 => Some(path),
+                Shape::Path(path)
+                    if path.stroke.color == egui::epaint::ColorMode::Solid(SELECTED)
+                        || path.stroke.color == egui::epaint::ColorMode::Solid(ROUTE) =>
+                {
+                    Some(path)
+                }
                 _ => None,
             })
             .collect();
@@ -1316,6 +1520,15 @@ mod tests {
                 .count(),
             2
         );
+        let selected = lines
+            .iter()
+            .find(|path| path.stroke.color == egui::epaint::ColorMode::Solid(SELECTED))
+            .unwrap();
+        let muted = lines
+            .iter()
+            .find(|path| path.stroke.color == egui::epaint::ColorMode::Solid(ROUTE))
+            .unwrap();
+        assert!(selected.stroke.width > muted.stroke.width);
         assert!(SELECTED.b() > SELECTED.r() && SELECTED.b() > SELECTED.g());
     }
 

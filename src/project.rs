@@ -73,6 +73,8 @@ pub struct Project {
     pub show_original: bool,
     pub trainer_mode: bool,
     pub studio_open: bool,
+    #[serde(default)]
+    pub page: Option<crate::ui::Page>,
     pub studio: ProjectState,
     pub map: ProjectView,
 }
@@ -101,6 +103,7 @@ impl Project {
             show_original: true,
             trainer_mode: false,
             studio_open: false,
+            page: None,
             studio,
             map,
         }

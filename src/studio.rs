@@ -1,3 +1,4 @@
+use crate::numeric::DragValue;
 use eframe::egui::{self, vec2, Color32, TextureHandle, TextureOptions};
 use rlv_forge::{
     bundle,
@@ -9,7 +10,7 @@ use rlv_forge::{
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, TryRecvError},
         Arc,
     },
@@ -23,7 +24,6 @@ enum Job {
 }
 
 pub enum Edit {
-    Cut(Clip),
     ReplaceCuts(Vec<CutRange>),
     Sync(Vec<SyncPoint>),
 }
@@ -47,6 +47,8 @@ pub struct Settings {
     #[serde(skip)]
     source_timing: Option<Arc<Timing>>,
     sync_points: Vec<SyncPoint>,
+    #[serde(default)]
+    zip_archive: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -73,6 +75,7 @@ pub struct Studio {
     sync_draft: Option<Vec<SyncPoint>>,
     sync_map: Option<SyncMap>,
     pick_kind: Option<Kind>,
+    cut_start: Option<SyncPoint>,
     pick_candidates: Vec<f64>,
     pick_time: f64,
     timing: Result<Timing, String>,
@@ -90,6 +93,7 @@ pub struct Studio {
     status: String,
     error: Option<String>,
     exporting: bool,
+    export_progress: Arc<AtomicU32>,
 }
 
 impl Default for Studio {
@@ -110,11 +114,13 @@ impl Default for Studio {
                 source_duration: None,
                 source_timing: None,
                 sync_points: Vec::new(),
+                zip_archive: false,
             },
             cut_draft: None,
             sync_draft: None,
             sync_map: None,
             pick_kind: None,
+            cut_start: None,
             pick_candidates: Vec::new(),
             pick_time: 0.0,
             timing: Err("Open a timestamped GPX track first.".into()),
@@ -132,6 +138,7 @@ impl Default for Studio {
             status: "Open a prepared video for reference. Only the GPX will be edited.".into(),
             error: None,
             exporting: false,
+            export_progress: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -143,7 +150,10 @@ impl Studio {
 
     pub fn project_state(&self) -> Result<ProjectState, String> {
         if self.pick_kind.is_some() {
-            return Err("Finish or cancel landmark picking before saving the project.".into());
+            return Err(
+                "Finish or cancel landmark picking or cut creation before saving the project."
+                    .into(),
+            );
         }
         let mut settings = self.settings.clone();
         settings.path = settings
@@ -233,6 +243,17 @@ impl Studio {
         self.settings.clone()
     }
 
+    pub fn export_changed(&self, before: &Settings) -> bool {
+        self.settings.offset != before.offset || self.settings.sync_points != before.sync_points
+    }
+
+    pub fn sync_sidebar(&mut self, ui: &mut egui::Ui) -> Option<Edit> {
+        ui.add_enabled_ui(!self.busy() && self.pick_kind.is_none(), |ui| {
+            self.show_sync_points(ui).map(Edit::Sync)
+        })
+        .inner
+    }
+
     pub fn video_path(&self) -> Option<PathBuf> {
         self.settings.path.clone()
     }
@@ -298,8 +319,7 @@ impl Studio {
         self.settings.sync_points = points;
         self.sync_map = mapping;
         self.sync_draft = None;
-        self.pick_kind = None;
-        self.pick_candidates.clear();
+        self.cancel_picking();
         self.refresh_track(Some(track));
         self.settings.marked = Clip {
             start: 0.0,
@@ -312,6 +332,42 @@ impl Studio {
 
     fn route_position(&self, track: Option<&Track>) -> Option<[f64; 2]> {
         timeline::position_at(self.timing.as_ref().ok()?, track?, self.gpx_time())
+    }
+
+    fn map_route_position(
+        &self,
+        track: Option<&Track>,
+        source: Option<&Track>,
+    ) -> Result<Option<[f64; 2]>, String> {
+        if self.pick_kind.is_some() {
+            return Ok(source.zip(self.settings.source_timing.as_ref()).and_then(
+                |(source, timing)| timeline::position_at(timing, source, self.pick_time),
+            ));
+        }
+        let preview = self
+            .sync_draft
+            .as_deref()
+            .filter(|points| !points.is_empty())
+            .map(|points| self.plan_for_points(points))
+            .transpose()?
+            .flatten();
+        if let (Some(preview), Some(source)) = (&preview, source) {
+            preview.validate_source(source)?;
+        }
+        Ok(
+            if let (Some(mapping), Some(source), Some(timing)) = (
+                preview.as_ref().or(self.sync_map.as_ref()),
+                source,
+                &self.settings.source_timing,
+            ) {
+                mapping
+                    .original_at(self.position)
+                    .ok()
+                    .and_then(|time| timeline::position_at(timing, source, time))
+            } else {
+                self.route_position(track)
+            },
+        )
     }
 
     fn speed_kmh(&self, source: Option<&Track>) -> Option<f64> {
@@ -355,36 +411,84 @@ impl Studio {
     fn sync_tools(&mut self, ui: &mut egui::Ui, source: Option<&Track>) -> Option<Vec<SyncPoint>> {
         let mut apply = None;
         ui.heading("Sync video frames to the original route");
+        ui.label("Start with Set video start: match the first video frame to the GPX route, then confirm to trim earlier data from the working copy. The original GPX/FIT file is never changed.");
+        ui.small("Set video end freezes the final frame. Choose its GPX position, then confirm to trim the trailing data from the working copy.");
         ui.label("Press Pick Landmark to freeze the video. Position the GPX marker using the map or its timeline, then press Pick Landmark again to create and automatically apply the sync point.");
-        ui.small("Landmarks correct alignment and drift. Use consecutive Before cut / After cut points on the last/first frames around a video edit to skip omitted GPX sections.");
-        ui.add_enabled_ui(!self.busy() && self.settings.source_timing.is_some() && self.cut_draft.is_none(), |ui| {
+        ui.small("Create cut captures the current video and GPX positions. Move only the GPX to the end of the omitted section, then press Done create cut. Its video boundary is one frame later.");
+        ui.add_enabled_ui(!self.busy() && source.is_some() && self.settings.source_timing.is_some() && self.cut_draft.is_none(), |ui| {
             ui.horizontal_wrapped(|ui| {
-                for (label, kind) in [("Pick Landmark", Kind::Normal), ("Pick before cut", Kind::BeforeCut), ("Pick after cut", Kind::AfterCut)] {
+                for kind in [Kind::VideoStart, Kind::VideoEnd] {
                     let active = self.pick_kind == Some(kind);
-                    if ui.add_enabled(active || (self.pick_kind.is_none() && self.preview_ready()), egui::Button::new(label).selected(active)).clicked() {
+                    let label = match (kind, active) {
+                        (Kind::VideoStart, false) => "Set video start",
+                        (Kind::VideoStart, true) => "Confirm video start",
+                        (_, false) => "Set video end",
+                        (_, true) => "Confirm video end",
+                    };
+                    let enabled = if active { self.preview_ready() } else { self.pick_kind.is_none() && self.sync_draft.is_none() };
+                    if ui.add_enabled(enabled, egui::Button::new(label).selected(active)).clicked() {
                         if active {
-                            if let (Some(source), Some(timing)) = (source, &self.settings.source_timing) {
-                                if timeline::position_at(timing, source, self.pick_time).is_some() {
-                                    self.append_sync_point(self.pick_time);
-                                    apply = self.sync_draft.clone();
-                                } else {
-                                    self.error = Some("Choose a recorded GPX location, not a gap between segments.".into());
+                            if let Some(source) = source {
+                                match self.finish_video_boundary(kind, source) {
+                                    Ok(points) => apply = Some(points),
+                                    Err(error) => self.error = Some(error),
                                 }
                             } else {
-                                self.error = Some("The original GPX is unavailable for picking.".into());
+                                self.error = Some("The original GPX is unavailable for matching video boundaries.".into());
                             }
-                        } else if let Err(error) = self.begin_picking(kind) {
+                        } else if let Err(error) = self.begin_video_boundary(kind) {
                             self.error = Some(error);
                         }
                     }
                 }
+                let active = self.pick_kind == Some(Kind::Normal);
+                if ui.add_enabled(active || (self.pick_kind.is_none() && self.preview_ready()), egui::Button::new("Pick Landmark").selected(active)).clicked() {
+                    if active {
+                        if let Some(source) = source {
+                            match self.validate_pick_location(source, self.pick_time) {
+                                Ok(()) => {
+                                    self.append_sync_point(self.pick_time);
+                                    apply = self.sync_draft.clone();
+                                }
+                                Err(error) => self.error = Some(error),
+                            }
+                        } else {
+                            self.error = Some("The original GPX is unavailable for picking.".into());
+                        }
+                    } else if let Err(error) = self.begin_picking(Kind::Normal) {
+                        self.error = Some(error);
+                    }
+                }
+                let active = self.cut_start.is_some();
+                let label = if active { "Done create cut" } else { "Create cut" };
+                if ui.add_enabled(active || (self.pick_kind.is_none() && self.preview_ready()), egui::Button::new(label).selected(active)).clicked() {
+                    if let Some(source) = source {
+                        if active {
+                            match self.finish_cut(source) {
+                                Ok(points) => apply = Some(points),
+                                Err(error) => self.error = Some(error),
+                            }
+                        } else if let Err(error) = self.begin_cut(source) {
+                            self.error = Some(error);
+                        }
+                    } else {
+                        self.error = Some("The original GPX is unavailable for creating a cut.".into());
+                    }
+                }
                 if self.pick_kind.is_some() && ui.button("Cancel picking").clicked() {
-                    self.pick_kind = None;
-                    self.pick_candidates.clear();
+                    self.cancel_picking();
                 }
             });
-            if let Some(kind) = self.pick_kind {
-                ui.add(egui::Label::new(format!("Video frozen at {:.3} s | Original GPX {:.3} s | Press {} again to apply.", self.position, self.pick_time, kind.label())).truncate());
+            if self.pick_kind == Some(Kind::VideoStart) {
+                let hint = if self.preview_ready() { "Choose the matching GPX position, then Confirm video start." } else { "Loading the first video frame..." };
+                ui.add(egui::Label::new(format!("Video frozen at 0.000 s | Trim GPX before {:.3} s | {hint}", self.pick_time)).truncate());
+            } else if self.pick_kind == Some(Kind::VideoEnd) {
+                let hint = if self.preview_ready() { "Choose the matching GPX position, then Confirm video end." } else { "Loading the final video frame..." };
+                ui.add(egui::Label::new(format!("Video frozen at {:.3} s | Trim GPX after {:.3} s | {hint}", self.position, self.pick_time)).truncate());
+            } else if let Some(before) = self.cut_start {
+                ui.add(egui::Label::new(format!("Video frozen at {:.3} s | Cut start GPX {:.3} s | End GPX {:.3} s | Press Done create cut to apply.", before.video, before.gpx, self.pick_time)).truncate());
+            } else if self.pick_kind.is_some() {
+                ui.add(egui::Label::new(format!("Video frozen at {:.3} s | Original GPX {:.3} s | Press Pick Landmark again to apply.", self.position, self.pick_time)).truncate());
             }
             if self.pick_kind.is_some() {
                 ui.add(egui::Label::new("For repeated route locations, choose the correct occurrence or adjust the original GPX time.").truncate());
@@ -399,7 +503,7 @@ impl Studio {
                             }
                         });
                     });
-                    ui.add_sized(vec2(110.0, ui.spacing().interact_size.y), egui::DragValue::new(&mut self.pick_time).speed(0.1).fixed_decimals(3)
+                    ui.add_sized(vec2(110.0, ui.spacing().interact_size.y), DragValue::new(&mut self.pick_time).speed(0.1).fixed_decimals(3)
                         .range(0.0..=self.settings.source_duration.unwrap_or(0.0)).suffix(" s"));
                 });
             }
@@ -416,9 +520,85 @@ impl Studio {
             .as_ref()
             .is_some_and(|mapping| mapping.has_unpaired_boundaries())
         {
-            ui.small("An unpaired cut boundary acts as an alignment landmark. Add its Before/After partner to cut and level the GPX section automatically.");
+            ui.small("An unpaired cut boundary acts as an alignment landmark. Revise its type or partner in the sync table. Create cut adds a complete pair automatically.");
         }
         apply
+    }
+
+    fn begin_video_boundary(&mut self, kind: Kind) -> Result<(), String> {
+        if self.has_cut_draft() {
+            return Err(
+                "Apply or cancel pending sync/cut changes before matching video boundaries.".into(),
+            );
+        }
+        let info = self
+            .settings
+            .info
+            .as_ref()
+            .ok_or("Open a prepared video first.")?;
+        if self.settings.source_timing.is_none() {
+            return Err("Open a timestamped GPX/FIT track first.".into());
+        }
+        let (position, initial_time) = match kind {
+            Kind::VideoStart => (0.0, 0.0),
+            Kind::VideoEnd => {
+                let position = info.duration - 1.0 / info.fps;
+                if !position.is_finite() || position <= 0.0 {
+                    return Err(
+                        "The video needs at least two playable frames to match its end.".into(),
+                    );
+                }
+                self.begin_picking(kind)?;
+                self.position = position;
+                return Ok(());
+            }
+            _ => return Err("Choose a video start or end boundary.".into()),
+        };
+        self.pause();
+        self.position = position;
+        self.pick_time = self
+            .settings
+            .sync_points
+            .iter()
+            .find(|point| point.kind == kind)
+            .map_or(initial_time, |point| point.gpx);
+        self.pick_kind = Some(kind);
+        self.cut_start = None;
+        self.pick_candidates.clear();
+        self.error = None;
+        Ok(())
+    }
+
+    fn finish_video_boundary(
+        &mut self,
+        kind: Kind,
+        source: &Track,
+    ) -> Result<Vec<SyncPoint>, String> {
+        if !matches!(kind, Kind::VideoStart | Kind::VideoEnd) || self.pick_kind != Some(kind) {
+            return Err("Start matching the video boundary first.".into());
+        }
+        self.validate_pick_location(source, self.pick_time)?;
+        let mut points = self.settings.sync_points.clone();
+        if points.iter().any(|point| {
+            point.video == self.position && matches!(point.kind, Kind::BeforeCut | Kind::AfterCut)
+        }) {
+            return Err("Move or remove the cut boundary at this video frame before matching the video boundary.".into());
+        }
+        points.retain(|point| point.video != self.position && point.kind != kind);
+        points.push(SyncPoint {
+            video: self.position,
+            gpx: self.pick_time,
+            kind,
+        });
+        points.sort_by(|a, b| a.video.total_cmp(&b.video));
+        self.plan_for_points(&points)?
+            .ok_or("The video boundary requires a synchronization point.")?
+            .validate_source(source)?;
+        self.sync_draft = Some(points.clone());
+        self.cancel_picking();
+        self.error = None;
+        self.dirty = true;
+        Ok(points)
     }
 
     fn preview_ready(&self) -> bool {
@@ -447,6 +627,7 @@ impl Studio {
         self.pause();
         self.pick_time = time.clamp(0.0, duration);
         self.pick_kind = Some(kind);
+        self.cut_start = None;
         self.pick_candidates.clear();
         self.error = None;
         Ok(())
@@ -454,7 +635,83 @@ impl Studio {
 
     fn cancel_picking(&mut self) {
         self.pick_kind = None;
+        self.cut_start = None;
         self.pick_candidates.clear();
+    }
+
+    fn validate_pick_location(&self, source: &Track, time: f64) -> Result<(), String> {
+        let timing = self
+            .settings
+            .source_timing
+            .as_deref()
+            .ok_or("The original GPX timeline is unavailable.")?;
+        if timeline::position_at(timing, source, time).is_none() {
+            return Err("Choose a recorded GPX location, not a gap between segments.".into());
+        }
+        Ok(())
+    }
+
+    fn cut_after_video_time(&self, before: f64) -> Result<f64, String> {
+        let info = self
+            .settings
+            .info
+            .as_ref()
+            .ok_or("Open a prepared video before creating a cut.")?;
+        let frame = 1.0 / info.fps;
+        let after = before + frame;
+        if !after.is_finite() || after <= before || after > info.duration - frame + 1e-6 {
+            return Err("A cut needs a following video frame. Move to an earlier frame before creating the cut.".into());
+        }
+        Ok(after)
+    }
+
+    fn begin_cut(&mut self, source: &Track) -> Result<(), String> {
+        self.cut_after_video_time(self.position)?;
+        self.begin_picking(Kind::AfterCut)?;
+        if let Err(error) = self.validate_pick_location(source, self.pick_time) {
+            self.cancel_picking();
+            return Err(error);
+        }
+        self.cut_start = Some(SyncPoint {
+            video: self.position,
+            gpx: self.pick_time,
+            kind: Kind::BeforeCut,
+        });
+        Ok(())
+    }
+
+    fn finish_cut(&mut self, source: &Track) -> Result<Vec<SyncPoint>, String> {
+        let before = self.cut_start.ok_or("Start creating a cut first.")?;
+        if self.pick_time <= before.gpx {
+            return Err("The cut's end GPX position must be later than its start. Move the GPX marker forward before choosing Done create cut.".into());
+        }
+        self.validate_pick_location(source, self.pick_time)?;
+        let after = SyncPoint {
+            video: self.cut_after_video_time(before.video)?,
+            gpx: self.pick_time,
+            kind: Kind::AfterCut,
+        };
+        let mut points = self
+            .sync_draft
+            .as_ref()
+            .unwrap_or(&self.settings.sync_points)
+            .clone();
+        if points
+            .iter()
+            .any(|point| point.video > before.video && point.video < after.video)
+        {
+            return Err("A sync point lies between the cut's two video frames. Move or remove that point before creating this cut.".into());
+        }
+        points.extend([before, after]);
+        points.sort_by(|a, b| a.video.total_cmp(&b.video));
+        self.plan_for_points(&points)?
+            .ok_or("A cut requires synchronization points.")?
+            .validate_source(source)?;
+        self.sync_draft = Some(points.clone());
+        self.cancel_picking();
+        self.error = None;
+        self.dirty = true;
+        Ok(points)
     }
 
     fn append_sync_point(&mut self, gpx: f64) {
@@ -470,8 +727,7 @@ impl Studio {
             .as_mut()
             .unwrap()
             .sort_by(|a, b| a.video.total_cmp(&b.video));
-        self.pick_kind = None;
-        self.pick_candidates.clear();
+        self.cancel_picking();
         self.error = None;
         self.dirty = true;
     }
@@ -513,18 +769,37 @@ impl Studio {
             ..Default::default()
         };
         if let (Some(source), Some(timing)) = (source, &self.settings.source_timing) {
-            for (index, point) in self
+            let cut_start = if self.pick_kind == Some(Kind::VideoStart) {
+                Some(0.0)
+            } else if self.pick_kind == Some(Kind::VideoEnd) {
+                Some(self.pick_time)
+            } else {
+                self.cut_start.map(|before| before.gpx)
+            };
+            let end = if self.pick_kind == Some(Kind::VideoEnd) {
+                timing.duration
+            } else {
+                self.pick_time
+            };
+            if let Some(start) = cut_start.filter(|start| end > *start) {
+                overlay.cut_preview = Some((timing.clone(), Clip { start, end }));
+            }
+            let points = self
                 .sync_draft
                 .as_ref()
-                .unwrap_or(&self.settings.sync_points)
-                .iter()
-                .enumerate()
-            {
-                if let Some(position) = timeline::position_at(timing, source, point.gpx) {
-                    overlay.markers.push(crate::map::SyncMarker {
-                        position,
-                        label: (index + 1).to_string(),
-                    });
+                .unwrap_or(&self.settings.sync_points);
+            for (row, range) in Self::sync_rows(points).enumerate() {
+                for (boundary, point) in points[range].iter().enumerate() {
+                    if let Some(position) = timeline::position_at(timing, source, point.gpx) {
+                        overlay.markers.push(crate::map::SyncMarker {
+                            position,
+                            label: if boundary == 0 {
+                                (row + 1).to_string()
+                            } else {
+                                format!("{} end", row + 1)
+                            },
+                        });
+                    }
                 }
             }
             if !self.pick_candidates.is_empty() {
@@ -549,6 +824,24 @@ impl Studio {
         overlay
     }
 
+    fn sync_rows(points: &[SyncPoint]) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let mut index = 0;
+        std::iter::from_fn(move || {
+            let point = points.get(index)?;
+            let start = index;
+            index += if point.kind == Kind::BeforeCut
+                && points
+                    .get(index + 1)
+                    .is_some_and(|next| next.kind == Kind::AfterCut)
+            {
+                2
+            } else {
+                1
+            };
+            Some(start..index)
+        })
+    }
+
     fn show_sync_points(&mut self, ui: &mut egui::Ui) -> Option<Vec<SyncPoint>> {
         ui.heading("Sync points");
         let mut points = self
@@ -563,45 +856,72 @@ impl Studio {
             egui::Grid::new("sync-point-table")
                 .striped(true)
                 .show(ui, |ui| {
-                    for heading in ["#", "Type", "Video seconds", "Original GPX seconds", ""] {
+                    for heading in ["#", "Type", "Video seconds", "GPX seconds /\nDuration", ""] {
                         ui.strong(heading);
                     }
                     ui.end_row();
-                    for (index, point) in points.iter_mut().enumerate() {
-                        ui.label((index + 1).to_string());
-                        egui::ComboBox::from_id_salt(("sync-kind", index))
-                            .selected_text(point.kind.label())
-                            .show_ui(ui, |ui| {
-                                for kind in [Kind::Normal, Kind::BeforeCut, Kind::AfterCut] {
-                                    ui.selectable_value(&mut point.kind, kind, kind.label());
-                                }
-                            });
-                        ui.add(
-                            egui::DragValue::new(&mut point.video)
+                    let rows: Vec<_> = Self::sync_rows(&points).collect();
+                    for (row, range) in rows.into_iter().enumerate() {
+                        let (point, rest) = points[range.clone()].split_first_mut().unwrap();
+                        ui.label((row + 1).to_string());
+                        if matches!(point.kind, Kind::VideoStart | Kind::VideoEnd) {
+                            ui.label(point.kind.label());
+                        } else if rest.is_empty() {
+                            egui::ComboBox::from_id_salt(("sync-kind", range.start))
+                                .selected_text(point.kind.label())
+                                .show_ui(ui, |ui| {
+                                    for kind in [Kind::Normal, Kind::BeforeCut, Kind::AfterCut] {
+                                        ui.selectable_value(&mut point.kind, kind, kind.label());
+                                    }
+                                });
+                        } else {
+                            ui.label("Cut").on_hover_text(format!(
+                                "Removes original GPX {:.3} s to {:.3} s. Duration is GPX time removed, not video time.",
+                                point.gpx, rest[0].gpx
+                            ));
+                        }
+                        let previous_video = point.video;
+                        let video_changed = ui.add_enabled(!matches!(point.kind, Kind::VideoStart | Kind::VideoEnd),
+                            DragValue::new(&mut point.video)
                                 .speed(0.01)
                                 .fixed_decimals(3)
                                 .suffix(" s"),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut point.gpx)
-                                .speed(0.1)
-                                .fixed_decimals(3)
-                                .suffix(" s"),
-                        );
+                        ).changed();
+                        if let Some(after) = rest.first_mut() {
+                            if video_changed {
+                                after.video += point.video - previous_video;
+                            }
+                            let mut duration = after.gpx - point.gpx;
+                            if ui.add(
+                                DragValue::new(&mut duration)
+                                    .speed(0.1)
+                                    .fixed_decimals(3)
+                                    .suffix(" s"),
+                            ).on_hover_text("Duration of the removed GPX section. Editing it moves the end; the original GPX start stays fixed.").changed() {
+                                after.gpx = point.gpx + duration;
+                            }
+                        } else {
+                            ui.add(
+                                DragValue::new(&mut point.gpx)
+                                    .speed(0.1)
+                                    .fixed_decimals(3)
+                                    .suffix(" s"),
+                            );
+                        }
                         ui.horizontal(|ui| {
                             if ui.small_button("Seek").clicked() {
                                 seek = Some(point.video);
                             }
                             if ui.small_button("Remove").clicked() {
-                                remove = Some(index);
+                                remove = Some(range);
                             }
                         });
                         ui.end_row();
                     }
                 });
         });
-        if let Some(index) = remove {
-            points.remove(index);
+        if let Some(range) = remove {
+            points.drain(range);
         }
         if points != before {
             self.sync_draft = Some(points);
@@ -633,8 +953,7 @@ impl Studio {
             {
                 self.sync_draft = None;
                 self.dirty = true;
-                self.pick_kind = None;
-                self.pick_candidates.clear();
+                self.cancel_picking();
             }
             if ui
                 .add_enabled(
@@ -648,9 +967,80 @@ impl Studio {
             }
         });
         if self.sync_draft.is_some() {
-            ui.small("Unapplied sync changes: the sliders, red marker and exports still use the applied mapping.");
+            ui.small("Unapplied sync changes: the map marker previews valid point edits at the current video time. Sliders and exports still use the applied mapping.");
         }
         apply
+    }
+
+    fn stage_coverage_corrections(&mut self, source: &Track) -> Result<(), String> {
+        let mapping = self
+            .sync_map
+            .as_ref()
+            .ok_or("Apply sync points before requesting boundary suggestions.")?;
+        if self.sync_draft.is_some() || self.cut_draft.is_some() {
+            return Err(
+                "Apply or cancel pending sync/cut changes before reviewing suggestions.".into(),
+            );
+        }
+        let additions = mapping.suggest_coverage_points()?;
+        if additions.is_empty() {
+            return Err("The applied sync points already cover the entire video.".into());
+        }
+        let mut points = self.settings.sync_points.clone();
+        points.extend(additions);
+        points.sort_by(|a, b| a.video.total_cmp(&b.video));
+        let candidate = self
+            .plan_for_points(&points)?
+            .ok_or("Boundary suggestions require a synchronization mapping.")?;
+        let exported = candidate.export(source, &source.name, &source.description)?;
+        timeline::validate_incyclist(&exported)?;
+        self.sync_draft = Some(points);
+        self.dirty = true;
+        self.error = None;
+        self.status = "Suggested boundary landmarks are in the sync table. Verify them against the footage, then choose Apply sync points (or Cancel sync changes). Existing landmarks, cuts and video are unchanged.".into();
+        Ok(())
+    }
+
+    fn show_sync_coverage(&mut self, ui: &mut egui::Ui, source: Option<&Track>) {
+        let Some(mapping) = &self.sync_map else {
+            return;
+        };
+        let Some(error) = mapping.coverage_error() else {
+            return;
+        };
+        ui.heading("Export coverage needs attention");
+        ui.colored_label(Color32::from_rgb(180, 90, 0), error);
+        match mapping.suggest_coverage_points() {
+            Ok(points) => {
+                for point in points {
+                    ui.label(format!(
+                        "Suggested landmark: video {:.3} s = original GPX {:.3} s.",
+                        point.video, point.gpx
+                    ));
+                }
+                ui.small("Boundary timing will change; existing landmarks and cut pairs are kept. These are timing assumptions, not detected visual matches.");
+                if ui
+                    .add_enabled(
+                        source.is_some() && self.sync_draft.is_none() && self.cut_draft.is_none(),
+                        egui::Button::new("Review suggested boundary landmarks"),
+                    )
+                    .clicked()
+                {
+                    if let Some(source) = source {
+                        if let Err(error) = self.stage_coverage_corrections(source) {
+                            self.error =
+                                Some(format!("Cannot stage boundary suggestions: {error}"));
+                        }
+                    }
+                }
+                if self.sync_draft.is_some() || self.cut_draft.is_some() {
+                    ui.small("Apply or cancel pending sync/cut changes before requesting suggestions. Coverage above describes the applied mapping.");
+                }
+            }
+            Err(error) => {
+                ui.label(error);
+            }
+        }
     }
 
     pub fn restore(&mut self, settings: Settings, track: Option<&Track>) {
@@ -659,8 +1049,7 @@ impl Studio {
         self.settings = settings;
         self.cut_draft = None;
         self.sync_draft = None;
-        self.pick_kind = None;
-        self.pick_candidates.clear();
+        self.cancel_picking();
         self.refresh_track(track);
         self.pause();
         if video_changed {
@@ -689,6 +1078,10 @@ impl Studio {
 
     pub fn busy(&self) -> bool {
         self.worker.is_some()
+    }
+
+    pub fn picking_landmark(&self) -> bool {
+        self.pick_kind.is_some()
     }
 
     pub fn pause(&mut self) {
@@ -748,8 +1141,7 @@ impl Studio {
         self.settings.sync_points.clear();
         self.sync_map = None;
         self.sync_draft = None;
-        self.pick_kind = None;
-        self.pick_candidates.clear();
+        self.cancel_picking();
         self.cut_draft = None;
         self.settings.marked = Clip {
             start: 0.0,
@@ -877,22 +1269,14 @@ impl Studio {
         Ok(())
     }
 
-    fn mark_from_video(&mut self, start: bool) {
-        if start {
-            self.settings.marked.start = self.position;
-        } else {
-            self.settings.marked.end = self.position;
-        }
-    }
-
     fn video_position_control(&mut self, ui: &mut egui::Ui, end: f64) -> egui::Response {
         ui.add_enabled_ui(self.pick_kind.is_none(), |ui| {
             let value = ui
-                .horizontal(|ui| {
+                .horizontal_wrapped(|ui| {
                     ui.label("Prepared video seconds:");
                     ui.add_sized(
                         vec2(110.0, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut self.position)
+                        DragValue::new(&mut self.position)
                             .range(0.0..=end)
                             .speed(0.1)
                             .fixed_decimals(3),
@@ -1014,7 +1398,7 @@ impl Studio {
         };
         let response = ui.add_enabled_ui(!self.busy() && range.is_some(), |ui| {
             let value = ui
-                .horizontal(|ui| {
+                .horizontal_wrapped(|ui| {
                     ui.label(if picking {
                         "Original GPX seconds:"
                     } else {
@@ -1022,7 +1406,7 @@ impl Studio {
                     });
                     ui.add_sized(
                         vec2(110.0, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut seconds)
+                        DragValue::new(&mut seconds)
                             .range(0.0..=duration)
                             .speed(0.1)
                             .fixed_decimals(3),
@@ -1086,28 +1470,38 @@ impl Studio {
             return None;
         }
         ui.small(
-            "Time bounds use the ORIGINAL GPX clock, in whole seconds. Overlapping time cuts are combined. Apply changes to rebuild the track.",
+            "GPX time uses the ORIGINAL clock. Duration is the removed interval. Apply changes to rebuild the track.",
         );
         let mut cuts = self
             .cut_draft
             .clone()
             .unwrap_or_else(|| self.settings.cuts.clone());
         let mut changed = false;
+        let start_heading = if cuts.iter().any(|cut| matches!(cut, CutRange::Distance(_))) {
+            "GPX distance"
+        } else {
+            "GPX time"
+        };
         ui.add_enabled_ui(self.sync_draft.is_none(), |ui| {
             egui::Grid::new("gpx_cuts").striped(true).show(ui, |ui| {
-                for heading in ["#", "Range basis", "In", "Out", "Span"] {
+                for heading in ["#", "Range basis", start_heading, "Duration"] {
                     ui.strong(heading);
                 }
                 ui.end_row();
                 for (index, cut) in cuts.iter_mut().enumerate() {
-                    let (basis, mut start, mut end, unit, decimals, speed) = match cut {
-                        CutRange::Time(clip) => {
-                            ("Original GPX time", clip.start, clip.end, "s", 0, 1.0)
-                        }
+                    let (basis, mut start, mut duration, unit, decimals, speed) = match cut {
+                        CutRange::Time(clip) => (
+                            "Original GPX time",
+                            clip.start,
+                            clip.duration(),
+                            "s",
+                            3,
+                            0.1,
+                        ),
                         CutRange::Distance(range) => (
                             "Sequential GPX distance",
                             range[0] / 1000.0,
-                            range[1] / 1000.0,
+                            (range[1] - range[0]) / 1000.0,
                             "km",
                             3,
                             0.01,
@@ -1117,35 +1511,32 @@ impl Studio {
                     ui.label(basis);
                     let start_changed = ui
                         .add(
-                            egui::DragValue::new(&mut start)
+                            DragValue::new(&mut start)
                                 .speed(speed)
                                 .fixed_decimals(decimals)
                                 .suffix(format!(" {unit}")),
                         )
                         .changed();
-                    let end_changed = ui
+                    let duration_changed = ui
                         .add(
-                            egui::DragValue::new(&mut end)
+                            DragValue::new(&mut duration)
                                 .speed(speed)
                                 .fixed_decimals(decimals)
                                 .suffix(format!(" {unit}")),
                         )
                         .changed();
-                    if start_changed || end_changed {
+                    if start_changed || duration_changed {
                         match cut {
                             CutRange::Time(clip) => {
-                                if start_changed {
-                                    clip.start = start.round();
-                                }
-                                if end_changed {
-                                    clip.end = end.round();
-                                }
+                                clip.start = start;
+                                clip.end = start + duration;
                             }
-                            CutRange::Distance(range) => *range = [start * 1000.0, end * 1000.0],
+                            CutRange::Distance(range) => {
+                                *range = [start * 1000.0, (start + duration) * 1000.0]
+                            }
                         }
                         changed = true;
                     }
-                    ui.label(format!("{:.decimals$} {unit}", end - start));
                     ui.end_row();
                 }
             });
@@ -1233,8 +1624,7 @@ impl Studio {
                     self.settings.offset = 0.0;
                     self.sync_map = mapping;
                     self.sync_draft = None;
-                    self.pick_kind = None;
-                    self.pick_candidates.clear();
+                    self.cancel_picking();
                     self.position = 0.0;
                     self.texture = None;
                     self.decoded_at = None;
@@ -1248,6 +1638,10 @@ impl Studio {
                         "Exported unchanged video ({:.3} s, {} frames), {} GPX points and ride.xml to {}.",
                         result.duration, result.frames, result.points, result.directory.display()
                     );
+                    if let Some(archive) = result.archive {
+                        self.status
+                            .push_str(&format!(" ZIP archive: {}.", archive.display()));
+                    }
                 }
                 Ok(Job::Cancelled) => self.status = "File dialog cancelled.".into(),
                 Err(error) => {
@@ -1288,7 +1682,9 @@ impl Studio {
     }
 
     fn decode_preview(&mut self, ctx: &egui::Context) {
-        if self.pick_kind.is_some()
+        if self
+            .pick_kind
+            .is_some_and(|kind| !matches!(kind, Kind::VideoStart | Kind::VideoEnd))
             || self.playing
             || self.busy()
             || self.preview_worker.is_some()
@@ -1371,6 +1767,10 @@ impl Studio {
     }
 
     fn export(&mut self, ctx: &egui::Context, track: &Track, name: &str, description: &str) {
+        if let Some(error) = self.sync_map.as_ref().and_then(SyncMap::coverage_error) {
+            self.error = Some(error);
+            return;
+        }
         if self.settings.folder.is_empty()
             || self.settings.folder == "."
             || self.settings.folder == ".."
@@ -1393,6 +1793,8 @@ impl Studio {
         let description = description.to_owned();
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
+        self.export_progress = Arc::new(AtomicU32::new(0));
+        let progress = self.export_progress.clone();
         self.status =
             "Copying the prepared video unchanged and exporting GPX / Incyclist XML...".into();
         self.spawn(ctx, move || {
@@ -1402,7 +1804,7 @@ impl Studio {
             else {
                 return Ok(Job::Cancelled);
             };
-            let result = bundle::export(
+            let result = bundle::export_with_progress(
                 bundle::Export {
                     track: &track,
                     video: &path,
@@ -1414,19 +1816,87 @@ impl Studio {
                 },
                 &parent.join(settings.folder),
                 &cancel,
+                settings.zip_archive,
+                |fraction| {
+                    progress.store((fraction * 1000.0) as u32, Ordering::Relaxed);
+                },
             )?;
             Ok(Job::Exported(result))
         });
         self.exporting = true;
     }
 
-    /// Returns a GPX-clock interval to cut; never edits the video timeline.
-    pub fn show(
+    pub fn show_delivery(
         &mut self,
         ui: &mut egui::Ui,
         tracks: Tracks<'_>,
         name: &str,
         description: &str,
+    ) {
+        let before = self.settings.clone();
+        ui.heading("Delivery");
+        if tracks.current.is_none() {
+            ui.label("Import a GPX or FIT track on Syncing before exporting a bundle.");
+        }
+        if self.settings.info.is_none() {
+            ui.label("Open a prepared video on Syncing before exporting a bundle.");
+        }
+        ui.add_enabled_ui(!self.busy(), |ui| {
+            self.show_sync_coverage(ui, tracks.source.map(Arc::as_ref));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Country (optional):");
+                ui.text_edit_singleline(&mut self.settings.country);
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("New bundle folder:");
+                ui.text_edit_singleline(&mut self.settings.folder);
+            });
+            ui.checkbox(&mut self.settings.zip_archive, "Also create a ZIP archive");
+            let ready =
+                tracks.current.is_some() && self.settings.info.is_some() && self.timing.is_ok();
+            if ui
+                .add_enabled(ready, egui::Button::new("Export Incyclist bundle..."))
+                .clicked()
+            {
+                let track = if self.sync_map.is_some() {
+                    tracks.source
+                } else {
+                    tracks.current
+                };
+                if let Some(track) = track {
+                    self.export(&ui.ctx().clone(), track, name, description);
+                }
+            }
+        });
+        ui.label("Export copies the entire video byte-for-byte (including audio), plus matching GPX and ride.xml. No video cuts, frame-rate conversion or re-encoding.");
+        if self.exporting {
+            let progress = self.export_progress.load(Ordering::Relaxed) as f32 / 1000.0;
+            ui.add(
+                egui::ProgressBar::new(progress)
+                    .show_percentage()
+                    .animate(true),
+            );
+            if ui.button("Cancel export").clicked() {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        } else if self.busy() {
+            ui.spinner();
+        }
+        ui.label(&self.status);
+        if let Some(error) = &self.error {
+            ui.colored_label(Color32::from_rgb(180, 35, 35), error);
+        }
+        if self.settings != before {
+            self.dirty = true;
+        }
+    }
+
+    /// Returns synchronization edits; never edits the video timeline.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        tracks: Tracks<'_>,
         map: &mut crate::map::TrackMap,
     ) -> Option<Edit> {
         let before = self.settings.clone();
@@ -1445,37 +1915,33 @@ impl Studio {
             self.toggle_play();
         }
         self.advance_playback(&ctx);
-        ui.heading("Prepared video & GPX editing");
-        ui.label("Video is read-only. Match frames to locations on the original GPX route; only the GPX is edited.");
-        ui.add_enabled_ui(!self.busy() && self.pick_kind.is_none(), |ui| {
-            if ui.button("Open prepared video...").clicked() {
-                self.open_video(&ctx, None);
-            }
-            if let Some(path) = &self.settings.path {
-                ui.label(path.display().to_string());
-            }
-        });
+        if track.is_none() {
+            ui.label("Use Edit > Open GPX/FIT... to import a working copy, then Open prepared video... and Set video start.");
+        }
+        if let Some(path) = &self.settings.path {
+            ui.add(egui::Label::new(path.display().to_string()).truncate());
+        } else {
+            ui.label("Use Edit > Open prepared video... to load a video. The video is read-only.");
+        }
+        if self.busy() {
+            ui.spinner();
+        }
+        if let Some(error) = &self.error {
+            ui.colored_label(Color32::from_rgb(180, 35, 35), error);
+        }
         if let Some(info) = self.settings.info.clone() {
             if let Some(points) = self.sync_tools(ui, source) {
                 cut = Some(Edit::Sync(points));
             }
-            let position = if self.pick_kind.is_some() {
-                tracks
-                    .source
-                    .map(Arc::as_ref)
-                    .zip(self.settings.source_timing.as_ref())
-                    .and_then(|(source, timing)| {
-                        timeline::position_at(timing, source, self.pick_time)
-                    })
-            } else if let (Some(mapping), Some(source), Some(timing)) =
-                (&self.sync_map, source, &self.settings.source_timing)
-            {
-                mapping
-                    .original_at(self.position)
-                    .ok()
-                    .and_then(|time| timeline::position_at(timing, source, time))
-            } else {
-                self.route_position(track)
+            let position = match self.map_route_position(track, source) {
+                Ok(position) => position,
+                Err(error) => {
+                    ui.colored_label(
+                        Color32::RED,
+                        format!("Cannot preview sync changes: {error}"),
+                    );
+                    None
+                }
             };
             let distance = if self.pick_kind.is_some() {
                 tracks
@@ -1522,6 +1988,35 @@ impl Studio {
                             );
                             ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
                         }
+                        ui.add_enabled_ui(!self.busy() && self.pick_kind.is_none(), |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .button(if self.playing { "Pause" } else { "Play" })
+                                    .clicked()
+                                {
+                                    self.toggle_play();
+                                }
+                                for (label, amount) in [
+                                    ("-10 s", -10.0),
+                                    ("-1 s", -1.0),
+                                    ("Previous frame", -1.0 / info.fps),
+                                    ("Next frame", 1.0 / info.fps),
+                                    ("+1 s", 1.0),
+                                    ("+10 s", 10.0),
+                                ] {
+                                    if ui.button(label).clicked() {
+                                        self.seek_video(
+                                            self.position + amount,
+                                            (info.duration - 1.0 / info.fps).max(0.0),
+                                        );
+                                    }
+                                }
+                            });
+                            self.video_position_control(
+                                ui,
+                                (info.duration - 1.0 / info.fps).max(0.0),
+                            );
+                        });
                     },
                 );
                 ui.allocate_ui_with_layout(
@@ -1547,32 +2042,6 @@ impl Studio {
                 "{} x {} | {:.3} fps | {:.3} s | playback is silent",
                 info.width, info.height, info.fps, info.duration
             ));
-            ui.add_enabled_ui(!self.busy() && self.pick_kind.is_none(), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button(if self.playing { "Pause" } else { "Play" })
-                        .clicked()
-                    {
-                        self.toggle_play();
-                    }
-                    for (label, amount) in [
-                        ("-10 s", -10.0),
-                        ("-1 s", -1.0),
-                        ("Previous frame", -1.0 / info.fps),
-                        ("Next frame", 1.0 / info.fps),
-                        ("+1 s", 1.0),
-                        ("+10 s", 10.0),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.seek_video(
-                                self.position + amount,
-                                (info.duration - 1.0 / info.fps).max(0.0),
-                            );
-                        }
-                    }
-                });
-                self.video_position_control(ui, (info.duration - 1.0 / info.fps).max(0.0));
-            });
             ui.add_enabled_ui(!self.busy(), |ui| {
                 let _ = self.profile.show(
                     ui,
@@ -1593,7 +2062,6 @@ impl Studio {
                 }
             }
             ui.add_enabled_ui(!self.busy() && self.pick_kind.is_none(), |ui| {
-                if let Some(points) = self.show_sync_points(ui) { cut = Some(Edit::Sync(points)); }
                 let location = if let Some(distance) = distance {
                     format!("{} GPX elapsed: {:.3} s | {:.3} km",
                         if self.pick_kind.is_some() { "Original" } else { "Current" },
@@ -1607,11 +2075,11 @@ impl Studio {
                         ui.add_enabled_ui(self.sync_map.is_none(), |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("GPX elapsed at video start:");
-                            ui.add(egui::DragValue::new(&mut self.settings.offset).speed(0.1).suffix(" s"));
+                            ui.add(DragValue::new(&mut self.settings.offset).speed(0.1).suffix(" s"));
                         });
                         ui.horizontal_wrapped(|ui| {
                             ui.label("This video frame matches GPX elapsed:");
-                            ui.add(egui::DragValue::new(&mut self.settings.anchor).speed(0.1)
+                            ui.add(DragValue::new(&mut self.settings.anchor).speed(0.1)
                                 .range(0.0..=timing.duration).suffix(" s"));
                             if ui.button("Set alignment").clicked() {
                                 self.settings.offset = self.settings.anchor - self.position;
@@ -1619,63 +2087,11 @@ impl Studio {
                         });
                         });
                         if self.sync_map.is_some() { ui.small("Sync points control alignment. Remove all sync points and apply to restore manual offset controls."); }
-                        ui.separator();
-                        ui.heading("Remove a section from the smoothed GPX");
-                        ui.label("Times refer to the CURRENT GPX, not the prepared video. Later GPX times close up after each cut.");
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("GPX in:");
-                            if ui.add_enabled(self.position <= timing.duration,
-                                egui::Button::new("Use video time").small())
-                                .on_hover_text("Copy prepared video seconds into GPX in, without applying the alignment offset. Available within the current GPX duration.")
-                                .clicked() {
-                                self.mark_from_video(true);
-                            }
-                            ui.add(egui::DragValue::new(&mut self.settings.marked.start).speed(0.1)
-                                .range(0.0..=timing.duration).suffix(" s").fixed_decimals(3));
-                            ui.label("GPX out:");
-                            if ui.add_enabled(self.position <= timing.duration,
-                                egui::Button::new("Use video time").small())
-                                .on_hover_text("Copy prepared video seconds into GPX out, without applying the alignment offset. Available within the current GPX duration.")
-                                .clicked() {
-                                self.mark_from_video(false);
-                            }
-                            ui.add(egui::DragValue::new(&mut self.settings.marked.end).speed(0.1)
-                                .range(0.0..=timing.duration).suffix(" s").fixed_decimals(3));
-                            if ui.add_enabled(!self.has_cut_draft(),
-                                egui::Button::new("Cut GPX section & level elevation")).clicked() {
-                                cut = Some(Edit::Cut(self.settings.marked));
-                            }
-                        });
-                        ui.label("The following section is shifted vertically to meet the preceding section. Its slopes are preserved.");
-                        ui.small("For visual selection on the route and elevation chart, use GPX smoothing > Cut selected GPX section.");
-                        if (timing.duration - self.gpx_at(info.duration)).abs() > 1.0 / info.fps {
-                            ui.colored_label(Color32::from_rgb(180, 90, 0),
-                                "GPX/video durations differ. Check cuts, alignment and landmarks near both ends before export.");
-                        }
                     }
                     Err(error) => { ui.colored_label(Color32::from_rgb(180, 35, 35), error); }
                 }
-                if let Some(cuts) = self.show_cuts(ui) { cut = Some(Edit::ReplaceCuts(cuts)); }
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Country (optional):");
-                    ui.text_edit_singleline(&mut self.settings.country);
-                    ui.label("New bundle folder:");
-                    ui.text_edit_singleline(&mut self.settings.folder);
-                });
-                if ui.add_enabled(track.is_some() && self.timing.is_ok(),
-                    egui::Button::new("Export Incyclist bundle...")).clicked() {
-                    let export_track = if self.sync_map.is_some() { source } else { track };
-                    if let Some(track) = export_track { self.export(&ctx, track, name, description); }
-                }
-                ui.label("Export copies the entire video byte-for-byte (including audio), plus matching GPX and ride.xml. No video cuts, frame-rate conversion or re-encoding.");
             });
             self.decode_preview(&ctx);
-        }
-        if self.settings.info.is_none() {
-            if let Some(cuts) = self.show_cuts(ui) {
-                cut = Some(Edit::ReplaceCuts(cuts));
-            }
         }
         if self.settings != before {
             self.dirty = true;
@@ -1685,18 +2101,6 @@ impl Studio {
             || self.pick_time != previous_pick_time
         {
             ctx.request_repaint();
-        }
-        if self.busy() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                if self.exporting && ui.button("Cancel export").clicked() {
-                    self.cancel.store(true, Ordering::Relaxed);
-                }
-            });
-        }
-        ui.label(&self.status);
-        if let Some(error) = &self.error {
-            ui.colored_label(Color32::from_rgb(180, 35, 35), error);
         }
         cut
     }
@@ -1936,25 +2340,17 @@ mod tests {
                                             current: Some(&source),
                                             source: Some(&source),
                                         },
-                                        "",
-                                        "",
                                         &mut map,
                                     );
                                 });
                         });
                     },
                 );
-                let mut positions: Vec<_> = [
-                    "Pick Landmark",
-                    "Play",
-                    "Previous frame",
-                    "Apply sync points",
-                    "Cut GPX section & level elevation",
-                    "Export Incyclist bundle...",
-                ]
-                .into_iter()
-                .map(|label| button(&output, label))
-                .collect();
+                let mut positions: Vec<_> =
+                    ["Pick Landmark", "Play", "Previous frame", "Set alignment"]
+                        .into_iter()
+                        .map(|label| button(&output, label))
+                        .collect();
                 positions.extend(output.shapes.iter().filter_map(|shape| match &shape.shape {
                     egui::Shape::Rect(rect)
                         if rect.fill == Color32::from_rgb(235, 241, 244)
@@ -2201,7 +2597,7 @@ mod tests {
     }
 
     #[test]
-    fn every_pick_button_requests_automatic_application_and_cut_pair_completion_is_undoable() {
+    fn landmarks_and_two_click_cuts_apply_automatically_and_cuts_are_one_undo_step() {
         let source = Arc::new(timeline_track());
         let mut track = source.clone();
         let mut studio = prepared_studio(&source, 40.04);
@@ -2229,8 +2625,6 @@ mod tests {
                                 current: Some(track),
                                 source: Some(&source),
                             },
-                            "",
-                            "",
                             &mut map,
                         );
                     });
@@ -2238,10 +2632,9 @@ mod tests {
             );
             (output, request)
         };
-        for (label, kind, video, gpx) in [
-            ("Pick Landmark", Kind::Normal, 0.0, 0.0),
-            ("Pick before cut", Kind::BeforeCut, 10.0, 10.0),
-            ("Pick after cut", Kind::AfterCut, 10.04, 30.0),
+        for (label, done, video, gpx, count) in [
+            ("Pick Landmark", "Pick Landmark", 0.0, 0.0, 1),
+            ("Create cut", "Done create cut", 10.0, 30.0, 3),
         ] {
             studio.position = video;
             ready_preview(&mut studio, &ctx);
@@ -2252,26 +2645,61 @@ mod tests {
             draw(&mut studio, &track, click(pick, true));
             let (_, request) = draw(&mut studio, &track, click(pick, false));
             assert!(request.is_none());
-            assert_eq!(studio.pick_kind, Some(kind));
+            assert!(studio.pick_kind.is_some());
+            assert!(studio.settings() == before.0);
+            assert!(studio.sync_draft.is_none());
+            if label == "Create cut" {
+                assert_eq!(
+                    studio.cut_start,
+                    Some(SyncPoint {
+                        video: 10.0,
+                        gpx: 10.0,
+                        kind: Kind::BeforeCut,
+                    })
+                );
+                studio.seek_video(20.0, 40.0);
+                studio.toggle_play();
+                studio.decode_preview(&ctx);
+                assert_eq!(studio.position, 10.0);
+                assert_eq!(studio.decoded_at, Some(10.0));
+                assert!(studio.preview_worker.is_none());
+                assert!(!studio.playing);
+            }
             studio.seek_gpx(gpx, 40.0).unwrap();
             let (output, _) = draw(&mut studio, &track, vec![]);
-            let pick = button(&output, label);
+            let pick = button(&output, done);
             draw(&mut studio, &track, click(pick, true));
             let (_, request) = draw(&mut studio, &track, click(pick, false));
             let Some(Edit::Sync(points)) = request else {
-                panic!("Releasing {label} must apply automatically")
+                panic!("Releasing {done} must apply automatically")
             };
-            assert_eq!(points.last().unwrap().kind, kind);
+            assert_eq!(points.len(), count);
+            if label == "Create cut" {
+                assert_eq!(
+                    &points[1..],
+                    &[
+                        SyncPoint {
+                            video: 10.0,
+                            gpx: 10.0,
+                            kind: Kind::BeforeCut,
+                        },
+                        SyncPoint {
+                            video: 10.0 + 1.0 / 25.0,
+                            gpx: 30.0,
+                            kind: Kind::AfterCut,
+                        },
+                    ]
+                );
+            }
             let mapping = studio.plan_for_points(&points).unwrap().unwrap();
             track = Arc::new(timeline::cut_ranges(&source, mapping.cuts()).unwrap());
             studio.commit_sync(&track, points).unwrap();
             history.record(before, &(studio.settings(), track.clone()), None);
             assert!(studio.sync_draft.is_none());
+            assert!(studio.cut_start.is_none());
+            assert!(studio.pick_kind.is_none());
             assert_eq!(studio.position, video);
-            assert_eq!(
-                studio.mapping().unwrap().has_unpaired_boundaries(),
-                kind == Kind::BeforeCut
-            );
+            assert!(!studio.mapping().unwrap().has_unpaired_boundaries());
         }
         assert_eq!(studio.sync_points().len(), 3);
         assert_eq!(
@@ -2285,8 +2713,8 @@ mod tests {
         let completed = (studio.settings(), track.clone());
         let (settings, uncut) = history.undo(completed.clone()).unwrap();
         studio.restore(settings, Some(&uncut));
-        assert_eq!(studio.sync_points().len(), 2);
-        assert!(studio.mapping().unwrap().has_unpaired_boundaries());
+        assert_eq!(studio.sync_points().len(), 1);
+        assert!(!studio.mapping().unwrap().has_unpaired_boundaries());
         assert!(studio.mapping().unwrap().cuts().is_empty());
         assert_eq!(studio.timing.as_ref().unwrap().duration, 60.0);
         let (settings, cut) = history.redo((studio.settings(), uncut)).unwrap();
@@ -2297,13 +2725,416 @@ mod tests {
     }
 
     #[test]
+    fn video_start_picking_trims_and_aligns_atomically_and_can_be_revised() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.0);
+        let ctx = egui::Context::default();
+        studio.position = 7.0;
+        ready_preview(&mut studio, &ctx);
+        let before = studio.settings();
+        let draw = |studio: &mut Studio, events| {
+            let mut request = None;
+            let output = crate::test_ui(
+                &ctx,
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        request = studio.sync_tools(ui, Some(&source));
+                    });
+                },
+            );
+            (output, request)
+        };
+        let (output, _) = draw(&mut studio, vec![]);
+        let start = button(&output, "Set video start");
+        draw(&mut studio, click(start, true));
+        draw(&mut studio, click(start, false));
+        assert_eq!(studio.position, 0.0);
+        assert_eq!(studio.pick_kind, Some(Kind::VideoStart));
+        assert!(!studio.preview_ready());
+        assert!(studio.project_state().is_err());
+        assert!(studio.settings() == before);
+        let (output, _) = draw(&mut studio, vec![]);
+        let confirm = button(&output, "Confirm video start");
+        draw(&mut studio, click(confirm, true));
+        let (_, request) = draw(&mut studio, click(confirm, false));
+        assert!(request.is_none());
+        assert_eq!(studio.pick_kind, Some(Kind::VideoStart));
+        ready_preview(&mut studio, &ctx);
+        studio.seek_gpx(20.0, 40.0).unwrap();
+        assert_eq!(studio.position, 0.0);
+        assert_eq!(
+            studio.sync_overlay(Some(&source)).cut_preview.unwrap().1,
+            Clip {
+                start: 0.0,
+                end: 20.0
+            }
+        );
+        let (output, _) = draw(&mut studio, vec![]);
+        let confirm = button(&output, "Confirm video start");
+        draw(&mut studio, click(confirm, true));
+        let (_, request) = draw(&mut studio, click(confirm, false));
+        let points = request.unwrap();
+        assert_eq!(
+            points,
+            [SyncPoint {
+                video: 0.0,
+                gpx: 20.0,
+                kind: Kind::VideoStart
+            }]
+        );
+        assert!(studio.settings() == before);
+        let mapping = studio.plan_for_points(&points).unwrap().unwrap();
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&track, points).unwrap();
+        assert_eq!(studio.gpx_time(), 0.0);
+        assert_eq!(studio.timing.as_ref().unwrap().duration, 40.0);
+        assert!(studio.pick_kind.is_none());
+        let completed = studio.settings();
+        let mut history = rlv_forge::history::History::default();
+        history.record(
+            (before.clone(), source.clone()),
+            &(completed.clone(), track.clone()),
+            None,
+        );
+        let (settings, original) = history.undo((completed.clone(), track.clone())).unwrap();
+        studio.restore(settings, Some(&original));
+        assert!(studio.sync_points().is_empty());
+        assert_eq!(studio.timing.as_ref().unwrap().duration, 60.0);
+        let (settings, track) = history.redo((studio.settings(), original)).unwrap();
+        studio.restore(settings, Some(&track));
+        let restored =
+            Studio::from_project(studio.project_state().unwrap(), &source, &track).unwrap();
+        assert_eq!(restored.sync_points(), studio.sync_points());
+        assert_eq!(restored.mapping().unwrap().original_at(0.0).unwrap(), 20.0);
+        studio.begin_video_boundary(Kind::VideoStart).unwrap();
+        assert_eq!(studio.pick_time, 20.0);
+        studio.seek_gpx(60.0, 40.0).unwrap();
+        assert!(studio
+            .finish_video_boundary(Kind::VideoStart, &source)
+            .is_err());
+        assert!(studio.settings() == completed);
+        assert_eq!(studio.pick_kind, Some(Kind::VideoStart));
+        studio.seek_gpx(10.0, 40.0).unwrap();
+        let points = studio
+            .finish_video_boundary(Kind::VideoStart, &source)
+            .unwrap();
+        assert_eq!(
+            studio.plan_for_points(&points).unwrap().unwrap().cuts(),
+            &[Clip {
+                start: 0.0,
+                end: 10.0
+            }]
+        );
+        studio.restore(completed.clone(), Some(&track));
+        studio.begin_video_boundary(Kind::VideoStart).unwrap();
+        studio.seek_gpx(5.0, 40.0).unwrap();
+        studio.cancel_picking();
+        assert!(studio.sync_draft.is_none());
+        assert!(studio.settings() == completed);
+    }
+
+    #[test]
+    fn video_end_picking_freezes_the_final_frame_and_trims_atomically() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.0);
+        let start = SyncPoint {
+            video: 0.0,
+            gpx: 10.0,
+            kind: Kind::VideoStart,
+        };
+        let mapping = studio.plan_for_points(&[start]).unwrap().unwrap();
+        let original = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&original, vec![start]).unwrap();
+        studio.position = 7.0;
+        let ctx = egui::Context::default();
+        ready_preview(&mut studio, &ctx);
+        let before = studio.settings();
+        let draw = |studio: &mut Studio, events| {
+            let mut request = None;
+            let output = crate::test_ui(
+                &ctx,
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        request = studio.sync_tools(ui, Some(&source));
+                    });
+                },
+            );
+            (output, request)
+        };
+        let (output, _) = draw(&mut studio, vec![]);
+        let end = button(&output, "Set video end");
+        draw(&mut studio, click(end, true));
+        draw(&mut studio, click(end, false));
+        assert_eq!(studio.position, 40.0 - 1.0 / 25.0);
+        assert_eq!(studio.pick_kind, Some(Kind::VideoEnd));
+        assert_eq!(studio.pick_time, 17.0);
+        assert!(!studio.preview_ready());
+        assert!(studio.project_state().is_err());
+        let (output, _) = draw(&mut studio, vec![]);
+        let confirm = button(&output, "Confirm video end");
+        draw(&mut studio, click(confirm, true));
+        let (_, request) = draw(&mut studio, click(confirm, false));
+        assert!(request.is_none());
+        ready_preview(&mut studio, &ctx);
+        studio.seek_gpx(50.0, 40.0).unwrap();
+        assert_eq!(studio.position, 39.96);
+        assert_eq!(
+            studio.sync_overlay(Some(&source)).cut_preview.unwrap().1,
+            Clip {
+                start: 50.0,
+                end: 60.0
+            }
+        );
+        let (output, _) = draw(&mut studio, vec![]);
+        let confirm = button(&output, "Confirm video end");
+        draw(&mut studio, click(confirm, true));
+        let (_, request) = draw(&mut studio, click(confirm, false));
+        let points = request.unwrap();
+        assert_eq!(points[0], start);
+        assert_eq!(
+            points[1],
+            SyncPoint {
+                video: 39.96,
+                gpx: 50.0,
+                kind: Kind::VideoEnd
+            }
+        );
+        assert!(studio.settings() == before);
+        let mapping = studio.plan_for_points(&points).unwrap().unwrap();
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&track, points).unwrap();
+        assert_eq!(studio.timing.as_ref().unwrap().duration, 40.0);
+        assert_eq!(studio.position, 39.96);
+        let completed = studio.settings();
+        let mut history = rlv_forge::history::History::default();
+        history.record(
+            (before.clone(), original.clone()),
+            &(completed.clone(), track.clone()),
+            None,
+        );
+        let (settings, track) = history.undo((completed.clone(), track)).unwrap();
+        studio.restore(settings, Some(&track));
+        assert_eq!(studio.sync_points(), &[start]);
+        let (settings, track) = history.redo((studio.settings(), track)).unwrap();
+        studio.restore(settings, Some(&track));
+        let restored =
+            Studio::from_project(studio.project_state().unwrap(), &source, &track).unwrap();
+        assert_eq!(
+            restored.mapping().unwrap().original_at(39.96).unwrap(),
+            50.0
+        );
+        studio.seek_video(20.0, 39.96);
+        let current_gpx = studio.mapping().unwrap().original_at(20.0).unwrap();
+        studio.begin_video_boundary(Kind::VideoEnd).unwrap();
+        assert_eq!(studio.pick_time, current_gpx);
+        assert_ne!(studio.pick_time, 50.0);
+        studio.seek_gpx(10.0, 40.0).unwrap();
+        assert!(studio
+            .finish_video_boundary(Kind::VideoEnd, &source)
+            .is_err());
+        assert_eq!(studio.pick_kind, Some(Kind::VideoEnd));
+        assert!(studio.settings() == completed);
+        studio.seek_gpx(55.0, 40.0).unwrap();
+        let points = studio
+            .finish_video_boundary(Kind::VideoEnd, &source)
+            .unwrap();
+        assert_eq!(
+            studio
+                .plan_for_points(&points)
+                .unwrap()
+                .unwrap()
+                .cuts()
+                .last(),
+            Some(&Clip {
+                start: 55.0,
+                end: 60.0
+            })
+        );
+        studio.restore(completed.clone(), Some(&track));
+        studio.begin_video_boundary(Kind::VideoEnd).unwrap();
+        studio.seek_gpx(45.0, 40.0).unwrap();
+        studio.cancel_picking();
+        assert!(studio.sync_draft.is_none());
+        assert!(studio.settings() == completed);
+        studio.settings.info.as_mut().unwrap().duration = 1.0 / 25.0;
+        assert!(studio.begin_video_boundary(Kind::VideoEnd).is_err());
+        assert!(studio.pick_kind.is_none());
+    }
+
+    #[test]
+    fn video_end_keeps_the_current_original_gpx_position_with_manual_cuts_and_offset() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.0);
+        let cuts = vec![CutRange::Time(Clip {
+            start: 10.0,
+            end: 20.0,
+        })];
+        let track = timeline::rebuild_cuts(&source, &cuts).unwrap();
+        studio.commit_cuts(&track, cuts).unwrap();
+        studio.settings.offset = 2.0;
+        studio.position = 15.0;
+        studio.begin_video_boundary(Kind::VideoEnd).unwrap();
+        assert_eq!(studio.position, 39.96);
+        assert_eq!(studio.pick_time, 27.0);
+    }
+
+    #[test]
+    fn cut_end_can_be_corrected_or_cancelled_without_leaving_partial_boundaries() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.04);
+        studio.position = 10.0;
+        let original = studio.settings();
+        assert!(studio.sync_overlay(Some(&source)).cut_preview.is_none());
+        studio.begin_cut(&source).unwrap();
+        assert!(studio.project_state().is_err());
+        for end in [10.0, 5.0] {
+            studio.seek_gpx(end, 40.0).unwrap();
+            assert!(studio.finish_cut(&source).is_err());
+            assert!(studio.cut_start.is_some());
+            assert!(studio.pick_kind.is_some());
+            assert!(studio.sync_draft.is_none());
+            assert!(studio.settings() == original);
+            assert!(studio.sync_overlay(Some(&source)).cut_preview.is_none());
+        }
+        studio.seek_gpx(30.0, 40.0).unwrap();
+        assert_eq!(
+            studio.sync_overlay(Some(&source)).cut_preview.unwrap().1,
+            Clip {
+                start: 10.0,
+                end: 30.0
+            }
+        );
+        let points = studio.finish_cut(&source).unwrap();
+        assert!(studio.sync_overlay(Some(&source)).cut_preview.is_none());
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].gpx, 10.0);
+        assert_eq!(points[1].gpx, 30.0);
+        assert!(studio.sync_points().is_empty());
+        studio.restore(original.clone(), Some(&source));
+        studio.begin_cut(&source).unwrap();
+        studio.seek_gpx(40.0, 40.0).unwrap();
+        assert_eq!(
+            studio.sync_overlay(Some(&source)).cut_preview.unwrap().1,
+            Clip {
+                start: 10.0,
+                end: 40.0
+            }
+        );
+        studio.cancel_picking();
+        assert!(studio.sync_overlay(Some(&source)).cut_preview.is_none());
+        assert!(studio.cut_start.is_none());
+        assert!(studio.pick_kind.is_none());
+        assert!(studio.sync_draft.is_none());
+        assert!(studio.settings() == original);
+        assert!(studio.project_state().is_ok());
+        studio.begin_cut(&source).unwrap();
+        studio.set_track(&source);
+        assert!(studio.cut_start.is_none());
+        assert!(studio.pick_kind.is_none());
+    }
+
+    #[test]
+    fn cut_creation_rejects_conflicting_sync_points_without_changing_the_draft() {
+        let source = timeline_track();
+        for video in [10.0, 10.02, 10.04] {
+            let mut studio = prepared_studio(&source, 40.04);
+            let points = vec![SyncPoint {
+                video,
+                gpx: 20.0,
+                kind: Kind::Normal,
+            }];
+            studio.commit_sync(&source, points.clone()).unwrap();
+            studio.sync_draft = Some(points.clone());
+            studio.dirty = false;
+            studio.position = 10.0;
+            studio.begin_cut(&source).unwrap();
+            studio.seek_gpx(30.0, 40.0).unwrap();
+            assert!(studio.finish_cut(&source).is_err(), "video {video}");
+            assert_eq!(studio.sync_points(), points);
+            assert_eq!(studio.sync_draft.as_ref(), Some(&points));
+            assert!(studio.cut_start.is_some());
+            assert!(!studio.dirty);
+        }
+    }
+
+    #[test]
+    fn cut_uses_the_videos_frame_rate_and_requires_a_following_frame() {
+        let source = timeline_track();
+        for fps in [25.0, 30_000.0 / 1001.0] {
+            let mut studio = prepared_studio(&source, 40.04);
+            studio.settings.info.as_mut().unwrap().fps = fps;
+            studio.position = 10.0;
+            studio.begin_cut(&source).unwrap();
+            studio.seek_gpx(30.0, 40.0).unwrap();
+            let points = studio.finish_cut(&source).unwrap();
+            assert_eq!(points[0].video, 10.0);
+            assert_eq!(points[1].video, 10.0 + 1.0 / fps);
+            studio.restore(studio.settings(), Some(&source));
+            studio.position = 40.04 - 1.0 / fps;
+            assert!(studio
+                .begin_cut(&source)
+                .unwrap_err()
+                .contains("following video frame"));
+            assert!(studio.cut_start.is_none());
+            assert!(studio.pick_kind.is_none());
+            studio.position = 40.04 - 2.0 / fps;
+            studio.begin_cut(&source).unwrap();
+        }
+    }
+
+    #[test]
+    fn cut_start_uses_the_applied_original_gpx_mapping() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 50.04);
+        let existing = vec![
+            SyncPoint {
+                video: 0.0,
+                gpx: 0.0,
+                kind: Kind::Normal,
+            },
+            SyncPoint {
+                video: 10.0,
+                gpx: 10.0,
+                kind: Kind::BeforeCut,
+            },
+            SyncPoint {
+                video: 10.04,
+                gpx: 20.0,
+                kind: Kind::AfterCut,
+            },
+        ];
+        let mapping = studio.plan_for_points(&existing).unwrap().unwrap();
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&track, existing).unwrap();
+        studio.position = 20.04;
+        studio.begin_cut(&source).unwrap();
+        assert!((studio.cut_start.unwrap().gpx - 30.0).abs() < 1e-9);
+        studio.seek_gpx(40.0, 40.0).unwrap();
+        let points = studio.finish_cut(&source).unwrap();
+        let mapping = studio.plan_for_points(&points).unwrap().unwrap();
+        assert_eq!(mapping.cuts().len(), 2);
+        assert!((mapping.cuts()[1].start - 30.0).abs() < 1e-9);
+        assert_eq!(mapping.cuts()[1].end, 40.0);
+    }
+
+    #[test]
     fn video_and_map_viewports_have_matching_dimensions_and_top_alignment() {
-        for width in [600.0, 1200.0] {
+        for width in [440.0, 600.0, 1200.0] {
             let source = Arc::new(timeline_track());
             let mut studio = prepared_studio(&source, 40.0);
             let mut map = crate::map::TrackMap::offline();
             let ctx = egui::Context::default();
             ready_preview(&mut studio, &ctx);
+            studio.status = "Hidden sync footer status".into();
+            studio.error = Some("Visible sync error".into());
             map.set_reference_track(source.clone());
             let texture = studio.texture.as_ref().unwrap().id();
             let output = crate::test_ui(
@@ -2323,13 +3154,28 @@ mod tests {
                                 current: Some(&source),
                                 source: Some(&source),
                             },
-                            "",
-                            "",
                             &mut map,
                         );
                     });
                 },
             );
+            for label in [
+                "GPX cuts",
+                "Remove a section from the smoothed GPX",
+                "GPX in:",
+                "GPX out:",
+                "Use video time",
+                "Cut GPX section & level elevation",
+                "Hidden sync footer status",
+                "Cancel export",
+                "GPX/video durations differ. Check cuts, alignment and landmarks near both ends before export.",
+            ] {
+                assert!(!output.shapes.iter().any(|shape| matches!(
+                    &shape.shape,
+                    egui::Shape::Text(text) if text.galley.job.text == label
+                )), "{label} should not appear on Syncing");
+            }
+            button(&output, "Set alignment");
             let video = output
                 .shapes
                 .iter()
@@ -2370,6 +3216,31 @@ mod tests {
                 (video.top() - map.top()).abs() < 1.0,
                 "{video:?} vs {map:?}"
             );
+            assert!(button(&output, "Visible sync error").y < video.top());
+            for label in [
+                "Play",
+                "Previous frame",
+                "Next frame",
+                "Prepared video seconds:",
+            ] {
+                let position = button(&output, label);
+                assert!(
+                    position.y > video.bottom(),
+                    "{label} must be below the video"
+                );
+                assert!(
+                    position.x >= video.left() && position.x <= video.right(),
+                    "{label} must stay within the video width"
+                );
+            }
+            for label in ["Fit track", "Online tiles", "GPX seconds:"] {
+                let position = button(&output, label);
+                assert!(position.y > map.bottom(), "{label} must be below the map");
+                assert!(
+                    position.x >= map.left() && position.x <= map.right(),
+                    "{label} must stay within the map width"
+                );
+            }
         }
     }
 
@@ -2423,6 +3294,85 @@ mod tests {
             has_audio: true,
         });
         studio
+    }
+
+    #[test]
+    fn coverage_suggestions_are_reviewable_cancellable_and_persist_as_a_draft() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.0);
+        let points = vec![
+            SyncPoint {
+                video: 10.0,
+                gpx: 5.0,
+                kind: Kind::Normal,
+            },
+            SyncPoint {
+                video: 30.0,
+                gpx: 55.0,
+                kind: Kind::Normal,
+            },
+        ];
+        studio.commit_sync(&source, points.clone()).unwrap();
+        studio.dirty = false;
+        studio.stage_coverage_corrections(&source).unwrap();
+        assert!(studio.dirty);
+        assert_eq!(studio.sync_points(), points);
+        assert!(studio.mapping().unwrap().coverage_error().is_some());
+        let draft = studio.sync_draft.clone().unwrap();
+        assert_eq!(draft.len(), 4);
+        assert_eq!(draft[1..3], points);
+        assert!(studio
+            .stage_coverage_corrections(&source)
+            .unwrap_err()
+            .contains("pending"));
+        let restored =
+            Studio::from_project(studio.project_state().unwrap(), &source, &source).unwrap();
+        assert_eq!(restored.sync_draft.as_ref(), Some(&draft));
+        studio.sync_draft = None;
+        assert_eq!(studio.sync_points(), points);
+        studio.stage_coverage_corrections(&source).unwrap();
+        studio.commit_sync(&source, draft).unwrap();
+        assert!(studio.mapping().unwrap().coverage_error().is_none());
+        assert!(studio.sync_draft.is_none());
+    }
+
+    #[test]
+    fn coverage_suggestions_do_not_replace_pending_cuts_or_hide_validation_errors() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.0);
+        studio
+            .commit_sync(
+                &source,
+                vec![
+                    SyncPoint {
+                        video: 10.0,
+                        gpx: 5.0,
+                        kind: Kind::Normal,
+                    },
+                    SyncPoint {
+                        video: 30.0,
+                        gpx: 55.0,
+                        kind: Kind::Normal,
+                    },
+                ],
+            )
+            .unwrap();
+        studio.cut_draft = Some(Vec::new());
+        assert!(studio
+            .stage_coverage_corrections(&source)
+            .unwrap_err()
+            .contains("pending"));
+        assert!(studio.sync_draft.is_none());
+        studio.cut_draft = None;
+        let wrong_source = Track::parse(
+            source
+                .export("", "")
+                .unwrap()
+                .replace("2026-01-01T00:01:00Z", "2026-01-01T00:01:01Z"),
+        )
+        .unwrap();
+        assert!(studio.stage_coverage_corrections(&wrong_source).is_err());
+        assert!(studio.sync_draft.is_none());
     }
 
     #[test]
@@ -2725,6 +3675,240 @@ mod tests {
         assert!(studio.sync_points().is_empty());
     }
 
+    #[test]
+    fn cut_row_edits_video_time_and_removed_gpx_duration_as_one_draft() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.04);
+        let points = vec![
+            SyncPoint {
+                video: 0.0,
+                gpx: 0.0,
+                kind: Kind::Normal,
+            },
+            SyncPoint {
+                video: 10.0,
+                gpx: 10.0,
+                kind: Kind::BeforeCut,
+            },
+            SyncPoint {
+                video: 10.04,
+                gpx: 30.0,
+                kind: Kind::AfterCut,
+            },
+            SyncPoint {
+                video: 40.04,
+                gpx: 60.0,
+                kind: Kind::Normal,
+            },
+        ];
+        let mapping = studio.plan_for_points(&points).unwrap().unwrap();
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&track, points.clone()).unwrap();
+        studio.position = 20.04;
+        let applied_position = studio
+            .map_route_position(Some(&track), Some(&source))
+            .unwrap();
+        let overlay = studio.sync_overlay(Some(&source));
+        assert_eq!(
+            overlay
+                .markers
+                .iter()
+                .map(|marker| marker.label.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2", "2 end", "3"]
+        );
+        let ctx = egui::Context::default();
+        let draw = |studio: &mut Studio, events| {
+            let mut request = None;
+            let output = crate::test_ui(
+                &ctx,
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        request = studio.show_sync_points(ui);
+                    });
+                },
+            );
+            (output, request)
+        };
+        let (output, _) = draw(&mut studio, vec![]);
+        button(&output, "Cut");
+        assert!(!output.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Text(text) if ["Before cut", "After cut"].contains(&text.galley.job.text.as_str())
+        )));
+        assert!(studio.sync_draft.is_none());
+        for (label, value) in [("10.000", "12"), ("20.000", "15")] {
+            let (output, _) = draw(&mut studio, vec![]);
+            let position = button(&output, label);
+            draw(&mut studio, click(position, true));
+            draw(&mut studio, click(position, false));
+            draw(&mut studio, vec![egui::Event::Text(value.into())]);
+            draw(
+                &mut studio,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        let draft = studio.sync_draft.as_ref().unwrap();
+        assert_eq!(draft[1].video, 12.0);
+        assert!((draft[2].video - 12.04).abs() < 1e-9);
+        assert_eq!(draft[1].gpx, 10.0);
+        assert_eq!(draft[2].gpx, 25.0);
+        assert_eq!(studio.sync_points(), points);
+        assert_eq!(studio.position, 20.04);
+        let timing = timeline::timing(&source).unwrap();
+        let preview_position = studio
+            .map_route_position(Some(&track), Some(&source))
+            .unwrap()
+            .unwrap();
+        let expected_position = timeline::position_at(&timing, &source, 35.0).unwrap();
+        for axis in 0..2 {
+            assert!((preview_position[axis] - expected_position[axis]).abs() < 1e-9);
+        }
+        assert_ne!(Some(preview_position), applied_position);
+        let (output, _) = draw(&mut studio, vec![]);
+        let apply = button(&output, "Apply sync points");
+        draw(&mut studio, click(apply, true));
+        let (_, request) = draw(&mut studio, click(apply, false));
+        let requested = request.unwrap();
+        let mapping = studio.plan_for_points(&requested).unwrap().unwrap();
+        mapping.validate_source(&source).unwrap();
+        assert_eq!(
+            mapping.cuts(),
+            &[Clip {
+                start: 10.0,
+                end: 25.0
+            }]
+        );
+        let (output, _) = draw(&mut studio, vec![]);
+        let cancel = button(&output, "Cancel sync changes");
+        draw(&mut studio, click(cancel, true));
+        draw(&mut studio, click(cancel, false));
+        assert!(studio.sync_draft.is_none());
+        assert_eq!(studio.sync_points(), points);
+        assert_eq!(studio.position, 20.04);
+        assert_eq!(
+            studio
+                .map_route_position(Some(&track), Some(&source))
+                .unwrap(),
+            applied_position
+        );
+    }
+
+    #[test]
+    fn cut_duration_preview_tracks_current_video_time_without_committing_the_cut() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.04);
+        let points = vec![
+            SyncPoint {
+                video: 10.0,
+                gpx: 10.0,
+                kind: Kind::BeforeCut,
+            },
+            SyncPoint {
+                video: 10.04,
+                gpx: 30.0,
+                kind: Kind::AfterCut,
+            },
+        ];
+        let mapping = studio.plan_for_points(&points).unwrap().unwrap();
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&track, points.clone()).unwrap();
+        let before = studio.settings();
+        let mut draft = points;
+        draft[1].gpx = 35.0;
+        studio.sync_draft = Some(draft.clone());
+        let timing = timeline::timing(&source).unwrap();
+        for (video, original) in [(5.0, 5.0), (10.02, 10.0), (20.04, 45.0)] {
+            studio.position = video;
+            let actual = studio
+                .map_route_position(Some(&track), Some(&source))
+                .unwrap()
+                .unwrap();
+            let expected = timeline::position_at(&timing, &source, original).unwrap();
+            for axis in 0..2 {
+                assert!((actual[axis] - expected[axis]).abs() < 1e-9);
+            }
+            assert_eq!(studio.position, video);
+            assert!(studio.settings() == before);
+        }
+        studio.sync_draft.as_mut().unwrap()[1].gpx = 5.0;
+        assert!(studio
+            .map_route_position(Some(&track), Some(&source))
+            .is_err());
+        studio.sync_draft = Some(draft.clone());
+        let preview = studio
+            .map_route_position(Some(&track), Some(&source))
+            .unwrap();
+        let mapping = studio.plan_for_points(&draft).unwrap().unwrap();
+        let updated = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&updated, draft).unwrap();
+        assert_eq!(studio.position, 20.04);
+        assert_eq!(
+            studio
+                .map_route_position(Some(&updated), Some(&source))
+                .unwrap(),
+            preview
+        );
+    }
+
+    #[test]
+    fn removing_a_cut_row_removes_both_boundaries_but_keeps_legacy_unpaired_points() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 40.04);
+        let points = vec![
+            SyncPoint {
+                video: 10.0,
+                gpx: 10.0,
+                kind: Kind::BeforeCut,
+            },
+            SyncPoint {
+                video: 10.04,
+                gpx: 30.0,
+                kind: Kind::AfterCut,
+            },
+            SyncPoint {
+                video: 40.0,
+                gpx: 60.0,
+                kind: Kind::BeforeCut,
+            },
+        ];
+        let mapping = studio.plan_for_points(&points).unwrap().unwrap();
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        studio.commit_sync(&track, points.clone()).unwrap();
+        let ctx = egui::Context::default();
+        let draw = |studio: &mut Studio, events| {
+            crate::test_ui(
+                &ctx,
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        studio.show_sync_points(ui);
+                    });
+                },
+            )
+        };
+        let output = draw(&mut studio, vec![]);
+        button(&output, "Before cut");
+        let remove = button(&output, "Remove");
+        draw(&mut studio, click(remove, true));
+        draw(&mut studio, click(remove, false));
+        assert_eq!(studio.sync_draft.as_ref().unwrap(), &points[2..]);
+        assert_eq!(studio.sync_points(), points);
+    }
+
     fn click(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
         vec![
             egui::Event::PointerMoved(pos),
@@ -2749,7 +3933,82 @@ mod tests {
                 }
                 None
             })
-            .unwrap()
+            .unwrap_or_else(|| panic!("Missing UI text {label:?}"))
+    }
+
+    #[test]
+    fn cut_table_edits_start_and_duration_on_the_original_clock() {
+        let source = timeline_track();
+        let mut studio = prepared_studio(&source, 60.0);
+        let cuts = vec![
+            CutRange::Time(Clip {
+                start: 3.0,
+                end: 7.0,
+            }),
+            CutRange::Time(Clip {
+                start: 20.0,
+                end: 25.0,
+            }),
+        ];
+        let track = timeline::rebuild_cuts(&source, &cuts).unwrap();
+        studio.commit_cuts(&track, cuts.clone()).unwrap();
+        let before = studio.settings();
+        let ctx = egui::Context::default();
+        let draw = |studio: &mut Studio, events| {
+            let mut request = None;
+            let output = crate::test_ui(
+                &ctx,
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        request = studio.show_cuts(ui);
+                    });
+                },
+            );
+            (output, request)
+        };
+        for (label, value, start, end) in
+            [("4.000", "2.5", 3.0, 5.5), ("3.000", "4.125", 4.125, 6.625)]
+        {
+            let (output, _) = draw(&mut studio, vec![]);
+            button(&output, "GPX time");
+            button(&output, "Duration");
+            let position = button(&output, label);
+            draw(&mut studio, click(position, true));
+            draw(&mut studio, click(position, false));
+            draw(&mut studio, vec![egui::Event::Text(value.into())]);
+            draw(
+                &mut studio,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(
+                studio.cut_draft.as_ref().unwrap(),
+                &[CutRange::Time(Clip { start, end }), cuts[1].clone()]
+            );
+            assert!(studio.settings() == before);
+        }
+        let (output, _) = draw(&mut studio, vec![]);
+        let apply = button(&output, "Apply cut changes");
+        draw(&mut studio, click(apply, true));
+        let (_, request) = draw(&mut studio, click(apply, false));
+        let revised = request.unwrap();
+        let track = timeline::rebuild_cuts(&source, &revised).unwrap();
+        studio.commit_cuts(&track, revised).unwrap();
+        studio.cut_draft = Some(cuts);
+        let (output, _) = draw(&mut studio, vec![]);
+        let cancel = button(&output, "Cancel cut changes");
+        draw(&mut studio, click(cancel, true));
+        draw(&mut studio, click(cancel, false));
+        assert!(studio.cut_draft.is_none());
     }
 
     #[test]
@@ -3076,30 +4335,6 @@ mod tests {
     }
 
     #[test]
-    fn marking_uses_video_seconds_directly_and_can_be_undone() {
-        let mut studio = Studio::default();
-        studio.settings.offset = 10.0;
-        studio.settings.marked = Clip {
-            start: 0.0,
-            end: 100.0,
-        };
-        let before = studio.settings();
-        studio.position = 42.123;
-        studio.mark_from_video(true);
-        assert_eq!(studio.settings.marked.start, 42.123);
-        assert_eq!(studio.settings.marked.end, 100.0);
-        studio.position = 67.89;
-        studio.mark_from_video(false);
-        assert_eq!(studio.settings.marked.start, 42.123);
-        assert_eq!(studio.settings.marked.end, 67.89);
-        let marked = studio.settings();
-        studio.restore(before.clone(), None);
-        assert!(studio.settings() == before);
-        studio.restore(marked.clone(), None);
-        assert!(studio.settings() == marked);
-    }
-
-    #[test]
     fn cut_rows_accumulate_follow_history_and_clear_with_a_new_track() {
         let points: String = (0..=10).map(|i| format!(
             "<trkpt lat=\"0\" lon=\"{}\"><ele>{}</ele><time>2026-01-01T00:00:{i:02}Z</time></trkpt>",
@@ -3159,6 +4394,7 @@ mod tests {
         };
         studio.settings.country = "SE".into();
         studio.settings.folder = "new-bundle".into();
+        studio.settings.zip_archive = true;
         let after = studio.settings();
         studio.restore(before.clone(), None);
         assert!(studio.settings() == before);

@@ -1,5 +1,6 @@
 mod cli;
 mod map;
+mod numeric;
 mod project;
 mod studio;
 mod ui;

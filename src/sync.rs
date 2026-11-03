@@ -6,6 +6,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Normal,
+    VideoStart,
+    VideoEnd,
     BeforeCut,
     AfterCut,
 }
@@ -14,6 +16,8 @@ impl Kind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Landmark",
+            Self::VideoStart => "Video start",
+            Self::VideoEnd => "Video end",
             Self::BeforeCut => "Before cut",
             Self::AfterCut => "After cut",
         }
@@ -33,6 +37,7 @@ pub struct SyncMap {
     edited: Vec<f64>,
     cuts: Vec<Clip>,
     source_duration: f64,
+    retained_duration: f64,
     video_duration: f64,
     unpaired_boundaries: bool,
 }
@@ -65,7 +70,7 @@ impl SyncMap {
                     .get(index + 1)
                     .is_some_and(|next| next.kind == Kind::AfterCut),
                 Kind::AfterCut => index > 0 && landmarks[index - 1].kind == Kind::BeforeCut,
-                Kind::Normal => true,
+                Kind::Normal | Kind::VideoStart | Kind::VideoEnd => true,
             };
             if !paired {
                 // A single cut boundary aligns the timelines until its partner is picked.
@@ -95,6 +100,28 @@ impl SyncMap {
                 );
             }
             match point.kind {
+                Kind::VideoStart => {
+                    if index != 0 || point.video != 0.0 || point.gpx >= source_duration {
+                        return Err("The video start must anchor video time zero to a GPX position before the end of the track.".into());
+                    }
+                    if point.gpx > 0.0 {
+                        cuts.push(Clip {
+                            start: 0.0,
+                            end: point.gpx,
+                        });
+                    }
+                }
+                Kind::VideoEnd => {
+                    if index + 1 != points.len() || point.video <= 0.0 || point.gpx <= 0.0 {
+                        return Err("The video end must be the last sync point and retain a positive GPX interval.".into());
+                    }
+                    if point.gpx < source_duration {
+                        cuts.push(Clip {
+                            start: point.gpx,
+                            end: source_duration,
+                        });
+                    }
+                }
                 Kind::BeforeCut => {
                     let after = points
                         .get(index + 1)
@@ -127,7 +154,7 @@ impl SyncMap {
                     return Err("A Before cut point must end a retained GPX section. Manual cuts must not cover or extend its boundary.".into()),
                 Kind::AfterCut if !kept.iter().any(|clip| point.gpx == clip.start) =>
                     return Err("An After cut point must start a retained GPX section. Manual cuts must not cover or extend its boundary.".into()),
-                Kind::Normal if kept.iter().any(|clip| point.gpx == clip.end && clip.end < source_duration) =>
+                Kind::Normal if kept.iter().any(|clip| point.gpx == clip.end && clip.end < kept.last().unwrap().end) =>
                     return Err("Use a Before cut / After cut pair for a sync point at the beginning of an omitted interval.".into()),
                 _ => {}
             }
@@ -150,6 +177,7 @@ impl SyncMap {
             edited,
             cuts,
             source_duration,
+            retained_duration: kept.iter().map(|clip| clip.duration()).sum(),
             video_duration,
             unpaired_boundaries,
         })
@@ -198,7 +226,11 @@ impl SyncMap {
         if right == 0 {
             self.rate(true)
         } else if right == self.points.len() {
-            self.rate(false)
+            if self.points[right - 1].kind == Kind::VideoEnd {
+                0.0
+            } else {
+                self.rate(false)
+            }
         } else {
             (self.edited[right] - self.edited[right - 1])
                 / (self.points[right].video - self.points[right - 1].video)
@@ -211,6 +243,9 @@ impl SyncMap {
             return self.edited[0] + (video - self.points[0].video) * self.rate(true);
         }
         if right == self.points.len() {
+            if self.points[right - 1].kind == Kind::VideoEnd {
+                return self.edited[right - 1];
+            }
             return self.edited[right - 1]
                 + (video - self.points[right - 1].video) * self.rate(false);
         }
@@ -251,6 +286,86 @@ impl SyncMap {
             + fraction * (self.points[right].video - self.points[right - 1].video)
     }
 
+    pub fn coverage_error(&self) -> Option<String> {
+        let start = self.edited_at(0.0);
+        let end = self.edited_at(self.video_duration);
+        if start >= -1e-6 && end <= self.retained_duration + 1e-6 && end > start {
+            return None;
+        }
+        let mut details = vec![format!(
+            "Sync points do not provide GPX coverage for the entire video.\n\
+             Video: 0.000 to {:.3} s. Retained GPX: 0.000 to {:.3} s after cuts.\n\
+             Video boundaries map to retained GPX {start:.3} and {end:.3} s.",
+            self.video_duration, self.retained_duration,
+        )];
+        if start < -1e-6 {
+            let first = self.points[0];
+            details.push(format!(
+                "Start: video 0.000 to {:.3} s is uncovered ({:.3} s of video; {:.3} s before retained GPX start).\n\
+                 First sync point: video {:.3} s / original GPX {:.3} s; extrapolated rate {:.6} GPX s/video s.",
+                self.video_at(0.0).clamp(0.0, self.video_duration),
+                self.video_at(0.0).clamp(0.0, self.video_duration),
+                -start, first.video, first.gpx, self.rate(true),
+            ));
+        }
+        if end > self.retained_duration + 1e-6 {
+            let last = self.points.last().unwrap();
+            let boundary = self
+                .video_at(self.retained_duration)
+                .clamp(0.0, self.video_duration);
+            details.push(format!(
+                "End: video {boundary:.3} to {:.3} s is uncovered ({:.3} s of video; {:.3} s beyond retained GPX end).\n\
+                 Last sync point: video {:.3} s / original GPX {:.3} s; extrapolated rate {:.6} GPX s/video s.",
+                self.video_duration, self.video_duration - boundary,
+                end - self.retained_duration, last.video, last.gpx, self.rate(false),
+            ));
+        }
+        if end <= start {
+            details.push("The mapping has no forward GPX duration across the video. Revise the cut boundary pairs.".into());
+        }
+        details.push("Verify landmarks at the affected end(s). Boundary suggestions assume the first/last retained GPX location matches the video boundary; check the footage before applying. The video is never trimmed or changed.".into());
+        Some(details.join("\n"))
+    }
+
+    /// Suggest only missing endpoints, preserving all existing landmarks and cut pairs.
+    pub fn suggest_coverage_points(&self) -> Result<Vec<SyncPoint>, String> {
+        if self.coverage_error().is_none() {
+            return Ok(Vec::new());
+        }
+        let kept = timeline::kept_intervals(self.source_duration, &self.cuts)?;
+        let mut additions = Vec::new();
+        if self.edited_at(0.0) < -1e-6 {
+            additions.push(SyncPoint {
+                video: 0.0,
+                gpx: kept.first().unwrap().start,
+                kind: Kind::Normal,
+            });
+        }
+        if self.edited_at(self.video_duration) > self.retained_duration + 1e-6 {
+            additions.push(SyncPoint {
+                video: self.video_duration,
+                gpx: kept.last().unwrap().end,
+                kind: Kind::Normal,
+            });
+        }
+        if additions.is_empty() {
+            return Err("No safe endpoint addition is available. Correct the existing cut boundary pairs using the footage.".into());
+        }
+        let mut points = self.points.clone();
+        points.extend_from_slice(&additions);
+        let candidate = Self::new(
+            &points,
+            &self.cuts,
+            self.source_duration,
+            self.video_duration,
+        )
+        .map_err(|error| format!("Cannot add boundary landmarks without conflicting with existing sync points: {error} Verify the affected landmarks manually."))?;
+        if let Some(error) = candidate.coverage_error() {
+            return Err(error);
+        }
+        Ok(additions)
+    }
+
     pub fn export(
         &self,
         source: &Track,
@@ -258,13 +373,10 @@ impl SyncMap {
         description: &str,
     ) -> Result<EditedTimeline, String> {
         self.validate_source(source)?;
-        let start = self.edited_at(0.0);
-        let end = self.edited_at(self.video_duration);
-        let kept = timeline::kept_intervals(self.source_duration, &self.cuts)?;
-        let retained_duration: f64 = kept.iter().map(|clip| clip.duration()).sum();
-        if start < -1e-6 || end > retained_duration + 1e-6 || end <= start {
-            return Err("Sync points do not provide GPX coverage for the entire video. Add or correct landmarks near both ends.".into());
+        if let Some(error) = self.coverage_error() {
+            return Err(error);
         }
+        let kept = timeline::kept_intervals(self.source_duration, &self.cuts)?;
         let source_start = self.original_at(0.0)?;
         let source_end = self.original_at(self.video_duration)?;
         let clips: Vec<_> = kept
@@ -292,7 +404,7 @@ impl SyncMap {
         }) {
             return Err("A sync point has no retained GPX coverage at an export boundary. Keep footage on both sides of each jump.".into());
         }
-        let times: Vec<_> = result
+        let mut times: Vec<_> = result
             .source_times
             .iter()
             .map(|seconds| {
@@ -310,10 +422,14 @@ impl SyncMap {
                 )?))
             })
             .collect::<Result<_, String>>()?;
+        let end_hold = self
+            .points
+            .last()
+            .is_some_and(|point| point.kind == Kind::VideoEnd && point.video < self.video_duration);
         if times.first().is_none_or(|time| time.abs() > 0.0005)
             || times
                 .last()
-                .is_none_or(|time| (time - self.video_duration).abs() > 0.0005)
+                .is_none_or(|time| !end_hold && (time - self.video_duration).abs() > 0.0005)
         {
             return Err("The synchronized GPX does not cover the full prepared video. Revise the first and last sync points.".into());
         }
@@ -331,6 +447,24 @@ impl SyncMap {
                 Ok(times[index])
             })
             .collect::<Result<_, String>>()?;
+        if end_hold {
+            // The final frame still occupies time up to the video's end boundary.
+            result.gpx = timeline::append_last_point(&result.gpx)?;
+            result.source_times.push(
+                *result
+                    .source_times
+                    .last()
+                    .ok_or("The synchronized GPX has no final sample.")?,
+            );
+            result.source_indices.push(
+                *result
+                    .source_indices
+                    .last()
+                    .ok_or("The synchronized GPX has no final source index.")?,
+            );
+            result.points += 1;
+            times.push(self.video_duration);
+        }
         result.gpx = timeline::retime_gpx(&result.gpx, &times)?;
         result.duration = self.video_duration;
         Ok(result)

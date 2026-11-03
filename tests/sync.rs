@@ -17,6 +17,105 @@ fn point(video: f64, gpx: f64, kind: Kind) -> SyncPoint {
 }
 
 #[test]
+fn video_start_trims_the_prefix_and_exports_from_video_zero_without_changing_source() {
+    let source = ride();
+    let original = source.clone();
+    for start in [0.0, 10.25] {
+        let mapping = SyncMap::new(
+            &[point(0.0, start, Kind::VideoStart)],
+            &[],
+            60.0,
+            60.0 - start,
+        )
+        .unwrap();
+        assert_eq!(mapping.edited_at(0.0), 0.0);
+        assert_eq!(mapping.original_at(0.0).unwrap(), start);
+        assert_eq!(mapping.video_at(0.0), 0.0);
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        assert!((track.points[0].longitude - start * 0.0001).abs() < 1e-9);
+        assert_eq!(timeline::timing(&track).unwrap().duration, 60.0 - start);
+        let exported = mapping.export(&source, "Start", "").unwrap();
+        timeline::validate_incyclist(&exported).unwrap();
+        let exported = Track::parse(exported.gpx).unwrap();
+        assert!((exported.points[0].longitude - start * 0.0001).abs() < 1e-9);
+        assert_eq!(
+            timeline::timing(&exported).unwrap().start,
+            "2000-01-01T00:00:00Z"
+        );
+        assert_eq!(source, original);
+    }
+    for (video, gpx) in [(1.0, 10.0), (0.0, 60.0)] {
+        assert!(SyncMap::new(&[point(video, gpx, Kind::VideoStart)], &[], 60.0, 40.0).is_err());
+    }
+}
+
+#[test]
+fn video_end_trims_the_tail_and_holds_the_last_position_for_the_final_frame() {
+    let source = ride();
+    let original = source.clone();
+    for fps in [25.0, 30_000.0 / 1001.0] {
+        let last_frame = 40.0 - 1.0 / fps;
+        let mapping = SyncMap::new(
+            &[
+                point(0.0, 10.0, Kind::VideoStart),
+                point(last_frame, 50.0, Kind::VideoEnd),
+            ],
+            &[],
+            60.0,
+            40.0,
+        )
+        .unwrap();
+        assert_eq!(
+            mapping.cuts(),
+            &[
+                Clip {
+                    start: 0.0,
+                    end: 10.0
+                },
+                Clip {
+                    start: 50.0,
+                    end: 60.0
+                }
+            ]
+        );
+        assert_eq!(mapping.original_at(last_frame).unwrap(), 50.0);
+        assert_eq!(mapping.original_at(40.0).unwrap(), 50.0);
+        assert_eq!(mapping.edited_at(40.0), 40.0);
+        assert_eq!(mapping.edited_rate_at(last_frame), 0.0);
+        assert_eq!(mapping.video_at(40.0), last_frame);
+        assert!(mapping.coverage_error().is_none());
+        let track = timeline::cut_ranges(&source, mapping.cuts()).unwrap();
+        assert!((track.points.last().unwrap().longitude - 0.005).abs() < 1e-9);
+        let exported = mapping.export(&source, "End", "").unwrap();
+        timeline::validate_incyclist(&exported).unwrap();
+        assert_eq!(exported.source_times.len(), exported.points);
+        assert_eq!(exported.source_indices.len(), exported.points);
+        let track = Track::parse(exported.gpx).unwrap();
+        let timing = timeline::timing(&track).unwrap();
+        assert_eq!(timing.duration, 40.0);
+        assert_eq!(
+            timing.seconds[timing.seconds.len() - 2],
+            (last_frame * 1000.0).round() / 1000.0
+        );
+        let last = &track.points[track.points.len() - 2..];
+        assert_eq!(last[0].longitude, last[1].longitude);
+        assert_eq!(last[0].elevation, last[1].elevation);
+        assert!((last[1].longitude - 0.005).abs() < 1e-9);
+        assert_eq!(source, original);
+    }
+    for points in [
+        vec![point(0.0, 50.0, Kind::VideoEnd)],
+        vec![point(39.96, 0.0, Kind::VideoEnd)],
+        vec![
+            point(39.96, 50.0, Kind::VideoEnd),
+            point(40.0, 55.0, Kind::Normal),
+        ],
+    ] {
+        assert!(SyncMap::new(&points, &[], 60.0, 40.0).is_err());
+    }
+}
+
+#[test]
 fn landmarks_support_offset_drift_inverse_seeking_and_exact_export_landmarks() {
     let single = SyncMap::new(&[point(5.0, 10.0, Kind::Normal)], &[], 60.0, 40.0).unwrap();
     assert_eq!(single.edited_at(15.0), 20.0);
@@ -260,4 +359,132 @@ fn sync_locations_cannot_interpolate_across_disconnected_recordings() {
     let map = SyncMap::new(&[point(29.5, 29.5, Kind::Normal)], &[], 60.0, 60.0).unwrap();
     assert!(map.validate_source(&track).is_err());
     assert!(map.export(&track, "", "").is_err());
+}
+
+#[test]
+fn coverage_reports_both_missing_ends_and_suggests_only_boundary_landmarks() {
+    let points = [
+        point(10.0, 5.0, Kind::Normal),
+        point(30.0, 55.0, Kind::Normal),
+    ];
+    let map = SyncMap::new(&points, &[], 60.0, 40.0).unwrap();
+    let error = map.export(&ride(), "", "").unwrap_err();
+    assert!(error.contains("Start: video 0.000 to 8.000 s"));
+    assert!(error.contains("End: video 32.000 to 40.000 s"));
+    assert!(error.contains("20.000 s before retained GPX start"));
+    assert!(error.contains("20.000 s beyond retained GPX end"));
+    assert!(error.contains("First sync point: video 10.000 s / original GPX 5.000 s"));
+    assert!(error.contains("Last sync point: video 30.000 s / original GPX 55.000 s"));
+    let additions = map.suggest_coverage_points().unwrap();
+    assert_eq!(
+        additions,
+        [
+            point(0.0, 0.0, Kind::Normal),
+            point(40.0, 60.0, Kind::Normal)
+        ]
+    );
+    let mut corrected = points.to_vec();
+    corrected.extend(additions);
+    let corrected = SyncMap::new(&corrected, &[], 60.0, 40.0).unwrap();
+    assert!(corrected.coverage_error().is_none());
+    assert!(corrected.suggest_coverage_points().unwrap().is_empty());
+    assert_eq!(corrected.edited_at(20.0), map.edited_at(20.0));
+    timeline::validate_incyclist(&corrected.export(&ride(), "", "").unwrap()).unwrap();
+    assert!(map.coverage_error().is_some());
+}
+
+#[test]
+fn boundary_suggestions_respect_manual_cuts_and_preserve_paired_jumps() {
+    let cuts = [
+        Clip {
+            start: 0.0,
+            end: 2.0,
+        },
+        Clip {
+            start: 58.0,
+            end: 60.0,
+        },
+    ];
+    let points = [
+        point(10.0, 5.0, Kind::Normal),
+        point(15.0, 15.0, Kind::BeforeCut),
+        point(15.04, 25.0, Kind::AfterCut),
+        point(30.0, 55.0, Kind::Normal),
+    ];
+    let map = SyncMap::new(&points, &cuts, 60.0, 40.0).unwrap();
+    let additions = map.suggest_coverage_points().unwrap();
+    assert_eq!(
+        additions,
+        [
+            point(0.0, 2.0, Kind::Normal),
+            point(40.0, 58.0, Kind::Normal)
+        ]
+    );
+    let mut corrected = points.to_vec();
+    corrected.extend(additions);
+    let corrected = SyncMap::new(&corrected, &cuts, 60.0, 40.0).unwrap();
+    assert_eq!(corrected.cuts(), map.cuts());
+    assert_eq!(corrected.original_at(15.02).unwrap(), 15.0);
+    assert_eq!(corrected.original_at(15.04).unwrap(), 25.0);
+    let exported = corrected.export(&ride(), "", "").unwrap();
+    assert_eq!(exported.cuts, [15.04]);
+    timeline::validate_incyclist(&exported).unwrap();
+}
+
+#[test]
+fn boundary_suggestions_reject_conflicts_instead_of_overwriting_landmarks() {
+    // The existing landmark already uses the first route location later in the video.
+    let map = SyncMap::new(&[point(10.0, 0.0, Kind::Normal)], &[], 60.0, 40.0).unwrap();
+    assert!(map
+        .suggest_coverage_points()
+        .unwrap_err()
+        .contains("conflicting"));
+    let hold = SyncMap::new(
+        &[
+            point(0.0, 10.0, Kind::BeforeCut),
+            point(10.0, 30.0, Kind::AfterCut),
+        ],
+        &[],
+        60.0,
+        10.0,
+    )
+    .unwrap();
+    assert!(hold
+        .coverage_error()
+        .unwrap()
+        .contains("no forward GPX duration"));
+    assert!(hold.suggest_coverage_points().is_err());
+}
+
+#[test]
+fn october_project_needs_only_a_start_landmark_not_an_end_correction() {
+    let points = [
+        point(16.602659063885962, 15.6, Kind::Normal),
+        point(1077.539208790536, 1076.5365497266498, Kind::BeforeCut),
+        point(1077.822659063886, 1093.3, Kind::AfterCut),
+        point(1347.760037109964, 1363.237378046078, Kind::BeforeCut),
+        point(1348.0800371099638, 1378.3, Kind::AfterCut),
+        point(1388.8600371099637, 1419.0799999999997, Kind::BeforeCut),
+        point(1389.1400371099635, 1443.6, Kind::AfterCut),
+        point(1713.7038830896113, 1768.1638459796457, Kind::BeforeCut),
+        point(1713.7638830896112, 1775.2, Kind::AfterCut),
+        point(2015.6461093372397, 2077.0822262476263, Kind::BeforeCut),
+        point(2015.8461093372396, 2097.8, Kind::AfterCut),
+        point(4768.360000000014, 4850.313890662754, Kind::BeforeCut),
+        point(4768.500000000017, 4868.5, Kind::AfterCut),
+    ];
+    let map = SyncMap::new(&points, &[], 5003.0, 4902.02).unwrap();
+    let error = map.coverage_error().unwrap();
+    assert!(error.contains("Start: video 0.000 to 1.003 s"));
+    assert!(!error.contains("End: video"));
+    let additions = map.suggest_coverage_points().unwrap();
+    assert_eq!(additions, [point(0.0, 0.0, Kind::Normal)]);
+    let mut corrected = points.to_vec();
+    corrected.extend(additions);
+    let corrected = SyncMap::new(&corrected, &[], 5003.0, 4902.02).unwrap();
+    assert!(corrected.coverage_error().is_none());
+    for pair in points.windows(2) {
+        let time = (pair[0].video + pair[1].video) / 2.0;
+        assert_eq!(corrected.edited_at(time), map.edited_at(time));
+    }
 }
